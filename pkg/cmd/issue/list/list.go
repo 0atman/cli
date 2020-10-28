@@ -47,6 +47,7 @@ func NewCmdList(f *cmdutil.Factory, runF func(*ListOptions) error) *cobra.Comman
 			$ gh issue list -l "help wanted"
 			$ gh issue list -A monalisa
 			$ gh issue list --web
+			$ gh issue list --milestone 'MVP'
 		`),
 		Args: cmdutil.NoArgsQuoteReminder,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -71,7 +72,7 @@ func NewCmdList(f *cmdutil.Factory, runF func(*ListOptions) error) *cobra.Comman
 	cmd.Flags().IntVarP(&opts.LimitResults, "limit", "L", 30, "Maximum number of issues to fetch")
 	cmd.Flags().StringVarP(&opts.Author, "author", "A", "", "Filter by author")
 	cmd.Flags().StringVar(&opts.Mention, "mention", "", "Filter by mention")
-	cmd.Flags().StringVarP(&opts.Milestone, "milestone", "m", "", "Filter by milestone `name`")
+	cmd.Flags().StringVarP(&opts.Milestone, "milestone", "m", "", "Filter by milestone `number` or `title`")
 
 	return cmd
 }
@@ -115,10 +116,16 @@ func listRun(opts *ListOptions) error {
 		return err
 	}
 
+	err = opts.IO.StartPager()
+	if err != nil {
+		return err
+	}
+	defer opts.IO.StopPager()
+
 	if isTerminal {
 		hasFilters := opts.State != "open" || len(opts.Labels) > 0 || opts.Assignee != "" || opts.Author != "" || opts.Mention != "" || opts.Milestone != ""
 		title := prShared.ListHeader(ghrepo.FullName(baseRepo), "issue", len(listResult.Issues), listResult.TotalCount, hasFilters)
-		fmt.Fprintf(opts.IO.ErrOut, "\n%s\n\n", title)
+		fmt.Fprintf(opts.IO.Out, "\n%s\n\n", title)
 	}
 
 	issueShared.PrintIssues(opts.IO, "", len(listResult.Issues), listResult.Issues)

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"sort"
 	"strings"
 	"time"
@@ -90,6 +91,8 @@ func GitHubRepo(client *Client, repo ghrepo.Interface) (*Repository, error) {
 	query RepositoryInfo($owner: String!, $name: String!) {
 		repository(owner: $owner, name: $name) {
 			id
+			name
+			owner { login }
 			hasIssuesEnabled
 			description
 			viewerPermission
@@ -125,6 +128,19 @@ func RepoDefaultBranch(client *Client, repo ghrepo.Interface) (string, error) {
 		return "", err
 	}
 	return r.DefaultBranchRef.Name, nil
+}
+
+func CanPushToRepo(httpClient *http.Client, repo ghrepo.Interface) (bool, error) {
+	if r, ok := repo.(*Repository); ok && r.ViewerPermission != "" {
+		return r.ViewerCanPush(), nil
+	}
+
+	apiClient := NewClientFromHTTP(httpClient)
+	r, err := GitHubRepo(apiClient, repo)
+	if err != nil {
+		return false, err
+	}
+	return r.ViewerCanPush(), nil
 }
 
 // RepoParent finds out the parent repository of a fork
@@ -303,8 +319,8 @@ func ForkRepo(client *Client, repo ghrepo.Interface) (*Repository, error) {
 	}, nil
 }
 
-// RepoFindFork finds a fork of repo affiliated with the viewer
-func RepoFindFork(client *Client, repo ghrepo.Interface) (*Repository, error) {
+// RepoFindForks finds forks of the repo that are affiliated with the viewer
+func RepoFindForks(client *Client, repo ghrepo.Interface, limit int) ([]*Repository, error) {
 	result := struct {
 		Repository struct {
 			Forks struct {
@@ -316,12 +332,13 @@ func RepoFindFork(client *Client, repo ghrepo.Interface) (*Repository, error) {
 	variables := map[string]interface{}{
 		"owner": repo.RepoOwner(),
 		"repo":  repo.RepoName(),
+		"limit": limit,
 	}
 
 	if err := client.GraphQL(repo.RepoHost(), `
-	query RepositoryFindFork($owner: String!, $repo: String!) {
+	query RepositoryFindFork($owner: String!, $repo: String!, $limit: Int!) {
 		repository(owner: $owner, name: $repo) {
-			forks(first: 1, affiliations: [OWNER, COLLABORATOR]) {
+			forks(first: $limit, affiliations: [OWNER, COLLABORATOR]) {
 				nodes {
 					id
 					name
@@ -336,14 +353,18 @@ func RepoFindFork(client *Client, repo ghrepo.Interface) (*Repository, error) {
 		return nil, err
 	}
 
-	forks := result.Repository.Forks.Nodes
-	// we check ViewerCanPush, even though we expect it to always be true per
-	// `affiliations` condition, to guard against versions of GitHub with a
-	// faulty `affiliations` implementation
-	if len(forks) > 0 && forks[0].ViewerCanPush() {
-		return InitRepoHostname(&forks[0], repo.RepoHost()), nil
+	var results []*Repository
+	for _, r := range result.Repository.Forks.Nodes {
+		// we check ViewerCanPush, even though we expect it to always be true per
+		// `affiliations` condition, to guard against versions of GitHub with a
+		// faulty `affiliations` implementation
+		if !r.ViewerCanPush() {
+			continue
+		}
+		results = append(results, InitRepoHostname(&r, repo.RepoHost()))
 	}
-	return nil, &NotFoundError{errors.New("no fork found")}
+
+	return results, nil
 }
 
 type RepoMetadataResult struct {
@@ -803,4 +824,44 @@ func RepoMilestones(client *Client, repo ghrepo.Interface) ([]RepoMilestone, err
 	}
 
 	return milestones, nil
+}
+
+func MilestoneByTitle(client *Client, repo ghrepo.Interface, title string) (*RepoMilestone, error) {
+	milestones, err := RepoMilestones(client, repo)
+	if err != nil {
+		return nil, err
+	}
+
+	for i := range milestones {
+		if strings.EqualFold(milestones[i].Title, title) {
+			return &milestones[i], nil
+		}
+	}
+	return nil, fmt.Errorf("no milestone found with title %q", title)
+}
+
+func MilestoneByNumber(client *Client, repo ghrepo.Interface, number int) (*RepoMilestone, error) {
+	var query struct {
+		Repository struct {
+			Milestone *RepoMilestone `graphql:"milestone(number: $number)"`
+		} `graphql:"repository(owner: $owner, name: $name)"`
+	}
+
+	variables := map[string]interface{}{
+		"owner":  githubv4.String(repo.RepoOwner()),
+		"name":   githubv4.String(repo.RepoName()),
+		"number": githubv4.Int(number),
+	}
+
+	gql := graphQLClient(client.http, repo.RepoHost())
+
+	err := gql.QueryNamed(context.Background(), "RepositoryMilestoneByNumber", &query, variables)
+	if err != nil {
+		return nil, err
+	}
+	if query.Repository.Milestone == nil {
+		return nil, fmt.Errorf("no milestone found with number '%d'", number)
+	}
+
+	return query.Repository.Milestone, nil
 }

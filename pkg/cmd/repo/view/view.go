@@ -1,13 +1,16 @@
 package view
 
 import (
+	"errors"
 	"fmt"
-	"html/template"
 	"net/http"
 	"strings"
+	"syscall"
+	"text/template"
 
 	"github.com/MakeNowJust/heredoc"
 	"github.com/cli/cli/api"
+	"github.com/cli/cli/internal/ghinstance"
 	"github.com/cli/cli/internal/ghrepo"
 	"github.com/cli/cli/pkg/cmdutil"
 	"github.com/cli/cli/pkg/iostreams"
@@ -22,6 +25,7 @@ type ViewOptions struct {
 
 	RepoArg string
 	Web     bool
+	Branch  string
 }
 
 func NewCmdView(f *cmdutil.Factory, runF func(*ViewOptions) error) *cobra.Command {
@@ -38,7 +42,9 @@ func NewCmdView(f *cmdutil.Factory, runF func(*ViewOptions) error) *cobra.Comman
 
 With no argument, the repository for the current directory is displayed.
 
-With '--web', open the repository in a web browser instead.`,
+With '--web', open the repository in a web browser instead.
+
+With '--branch', view a specific branch of the repository.`,
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(c *cobra.Command, args []string) error {
 			if len(args) > 0 {
@@ -52,6 +58,7 @@ With '--web', open the repository in a web browser instead.`,
 	}
 
 	cmd.Flags().BoolVarP(&opts.Web, "web", "w", false, "Open a repository in the browser")
+	cmd.Flags().StringVarP(&opts.Branch, "branch", "b", "", "View a specific branch of the repository")
 
 	return cmd
 }
@@ -63,6 +70,7 @@ func viewRun(opts *ViewOptions) error {
 	}
 
 	var toView ghrepo.Interface
+	apiClient := api.NewClientFromHTTP(httpClient)
 	if opts.RepoArg == "" {
 		var err error
 		toView, err = opts.BaseRepo()
@@ -71,13 +79,19 @@ func viewRun(opts *ViewOptions) error {
 		}
 	} else {
 		var err error
-		toView, err = ghrepo.FromFullName(opts.RepoArg)
+		viewURL := opts.RepoArg
+		if !strings.Contains(viewURL, "/") {
+			currentUser, err := api.CurrentLoginName(apiClient, ghinstance.Default())
+			if err != nil {
+				return err
+			}
+			viewURL = currentUser + "/" + viewURL
+		}
+		toView, err = ghrepo.FromFullName(viewURL)
 		if err != nil {
 			return fmt.Errorf("argument error: %w", err)
 		}
 	}
-
-	apiClient := api.NewClientFromHTTP(httpClient)
 
 	repo, err := api.GitHubRepo(apiClient, toView)
 	if err != nil {
@@ -94,10 +108,16 @@ func viewRun(opts *ViewOptions) error {
 
 	fullName := ghrepo.FullName(toView)
 
-	readme, err := RepositoryReadme(httpClient, toView)
+	readme, err := RepositoryReadme(httpClient, toView, opts.Branch)
 	if err != nil && err != NotFoundError {
 		return err
 	}
+
+	err = opts.IO.StartPager()
+	if err != nil {
+		return err
+	}
+	defer opts.IO.StopPager()
 
 	stdout := opts.IO.Out
 
@@ -158,7 +178,7 @@ func viewRun(opts *ViewOptions) error {
 	}
 
 	err = tmpl.Execute(stdout, repoData)
-	if err != nil {
+	if err != nil && !errors.Is(err, syscall.EPIPE) {
 		return err
 	}
 

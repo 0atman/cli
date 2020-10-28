@@ -1,40 +1,24 @@
 # GitHub CLI
 
-`gh` is GitHub on the command line, and it's now available in beta. It brings pull requests, issues, and other GitHub concepts to
-the terminal next to where you are already working with `git` and your code.
+`gh` is GitHub on the command line. It brings pull requests, issues, and other GitHub concepts to the terminal next to where you are already working with `git` and your code.
 
 ![screenshot of gh pr status](https://user-images.githubusercontent.com/98482/84171218-327e7a80-aa40-11ea-8cd1-5177fc2d0e72.png)
 
 ## Availability
 
-While in beta, GitHub CLI is available for repos hosted on GitHub.com only. It currently does not support repositories hosted on GitHub Enterprise Server or other hosting providers. We are planning on adding support for GitHub Enterprise Server after GitHub CLI is out of beta (likely towards the end of 2020), and we want to ensure that the API endpoints we use are more widely available for GHES versions that most GitHub customers are on.
+GitHub CLI is available for repositories hosted on GitHub.com and GitHub Enterprise Server 2.20+, and to install on macOS, Windows, and Linux. 
 
-## We need your feedback
-
-GitHub CLI is currently in its early development stages, and we're hoping to get feedback from people using it.
-
-If you've installed and used `gh`, we'd love for you to take a short survey here (no more than five minutes): https://forms.gle/umxd3h31c7aMQFKG7
-
-And if you spot bugs or have features that you'd really like to see in `gh`, please check out the [contributing page][]
-
-## Usage
-
-- `gh pr [status, list, view, checkout, create]`
-- `gh issue [status, list, view, create]`
-- `gh repo [view, create, clone, fork]`
-- `gh config [get, set]`
-- `gh help`
 
 ## Documentation
 
-Read the [official docs](https://cli.github.com/manual/) for more information.
+Read the [official docs][] for usage and more information.
 
-## Comparison with hub
 
-For many years, [hub][] was the unofficial GitHub CLI tool. `gh` is a new project that helps us explore
-what an official GitHub CLI tool can look like with a fundamentally different design. While both
-tools bring GitHub to the terminal, `hub` behaves as a proxy to `git`, and `gh` is a standalone
-tool. Check out our [more detailed explanation](/docs/gh-vs-hub.md) to learn more.
+
+## We want your feedback
+
+We'd love to hear your feedback about `gh`. If you spot bugs or have features that you'd really like to see in `gh`, please check out the [contributing page][].
+
 
 
 <!-- this anchor is linked to from elsewhere, so avoid renaming it -->
@@ -46,31 +30,21 @@ tool. Check out our [more detailed explanation](/docs/gh-vs-hub.md) to learn mor
 
 #### Homebrew
 
-Install:
-
-```bash
-brew install github/gh/gh
-```
-
-Upgrade:
-
-```bash
-brew upgrade gh
-```
+|Install:|Upgrade:|
+|---|---|
+|`brew install gh`|`brew upgrade gh`|
 
 #### MacPorts
 
-Install:
+|Install:|Upgrade:|
+|---|---|
+|`sudo port install gh`|`sudo port selfupdate && sudo port upgrade gh`|
 
-```bash
-sudo port install gh
-```
 
-Upgrade:
 
-```bash
-sudo port selfupdate && sudo port upgrade gh
-```
+### Linux
+
+See [Linux installation docs](/docs/install_linux.md).
 
 ### Windows
 
@@ -93,65 +67,14 @@ scoop update gh
 
 #### Chocolatey
 
-Install:
+|Install:|Upgrade:|
+|---|---|
+|`choco install gh`|`choco upgrade gh`|
 
-```powershell
-choco install gh
-```
-
-Upgrade:
-
-```powershell
-choco upgrade gh
-```
 
 #### Signed MSI
 
 MSI installers are available for download on the [releases page][].
-
-### Debian/Ubuntu Linux
-
-Install and upgrade:
-
-1. Download the `.deb` file from the [releases page][];
-2. Install the downloaded file: `sudo apt install ./gh_*_linux_amd64.deb`
-
-### Fedora Linux
-
-Install and upgrade:
-
-1. Download the `.rpm` file from the [releases page][];
-2. Install the downloaded file: `sudo dnf install gh_*_linux_amd64.rpm`
-
-### Centos Linux
-
-Install and upgrade:
-
-1. Download the `.rpm` file from the [releases page][];
-2. Install the downloaded file: `sudo yum localinstall gh_*_linux_amd64.rpm` 
-
-### openSUSE/SUSE Linux
-
-Install and upgrade:
-
-1. Download the `.rpm` file from the [releases page][];
-2. Install the downloaded file: `sudo zypper in gh_*_linux_amd64.rpm`
-
-### Arch Linux
-
-Arch Linux users can install from the [community repo](https://www.archlinux.org/packages/community/x86_64/github-cli/):
-
-```bash
-pacman -S github-cli
-```
-
-### Android
-
-Android users can install via Termux:
-
-```bash
-pkg install gh
-```
 
 ### Other platforms
 
@@ -159,11 +82,21 @@ Download packaged binaries from the [releases page][].
 
 ### Build from source
 
-See here on how to [build GitHub CLI from source](/docs/source.md).
+See here on how to [build GitHub CLI from source][build from source].
 
-[docs]: https://cli.github.com/manual
+## Comparison with hub
+
+For many years, [hub][] was the unofficial GitHub CLI tool. `gh` is a new project that helps us explore
+what an official GitHub CLI tool can look like with a fundamentally different design. While both
+tools bring GitHub to the terminal, `hub` behaves as a proxy to `git`, and `gh` is a standalone
+tool. Check out our [more detailed explanation][gh-vs-hub] to learn more.
+
+
+[official docs]: https://cli.github.com/manual
 [scoop]: https://scoop.sh
 [Chocolatey]: https://chocolatey.org
 [releases page]: https://github.com/cli/cli/releases/latest
 [hub]: https://github.com/github/hub
 [contributing page]: https://github.com/cli/cli/blob/trunk/.github/CONTRIBUTING.md
+[gh-vs-hub]: /docs/gh-vs-hub.md
+[build from source]: /docs/source.md

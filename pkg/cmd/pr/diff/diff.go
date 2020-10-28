@@ -2,10 +2,12 @@ package diff
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
+	"syscall"
 
 	"github.com/cli/cli/api"
 	"github.com/cli/cli/context"
@@ -42,6 +44,10 @@ func NewCmdDiff(f *cmdutil.Factory, runF func(*DiffOptions) error) *cobra.Comman
 		RunE: func(cmd *cobra.Command, args []string) error {
 			// support `-R, --repo` override
 			opts.BaseRepo = f.BaseRepo
+
+			if repoOverride, _ := cmd.Flags().GetString("repo"); repoOverride != "" && len(args) == 0 {
+				return &cmdutil.FlagError{Err: errors.New("argument required when using the --repo flag")}
+			}
 
 			if len(args) > 0 {
 				opts.SelectorArg = args[0]
@@ -85,8 +91,17 @@ func diffRun(opts *DiffOptions) error {
 	}
 	defer diff.Close()
 
+	err = opts.IO.StartPager()
+	if err != nil {
+		return err
+	}
+	defer opts.IO.StopPager()
+
 	if opts.UseColor == "never" {
 		_, err = io.Copy(opts.IO.Out, diff)
+		if errors.Is(err, syscall.EPIPE) {
+			return nil
+		}
 		return err
 	}
 

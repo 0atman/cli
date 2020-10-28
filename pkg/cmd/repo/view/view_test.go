@@ -47,6 +47,14 @@ func TestNewCmdView(t *testing.T) {
 				Web:     true,
 			},
 		},
+		{
+			name: "sets branch",
+			cli:  "-b feat/awesome",
+			wants: ViewOptions{
+				RepoArg: "",
+				Branch:  "feat/awesome",
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -80,6 +88,7 @@ func TestNewCmdView(t *testing.T) {
 			assert.NoError(t, err)
 
 			assert.Equal(t, tt.wants.Web, gotOpts.Web)
+			assert.Equal(t, tt.wants.Branch, gotOpts.Branch)
 			assert.Equal(t, tt.wants.RepoArg, gotOpts.RepoArg)
 		})
 	}
@@ -104,9 +113,7 @@ func Test_RepoView_Web(t *testing.T) {
 
 	for _, tt := range tests {
 		reg := &httpmock.Registry{}
-		reg.Register(
-			httpmock.GraphQL(`query RepositoryInfo\b`),
-			httpmock.StringResponse(`{}`))
+		reg.StubRepoInfoResponse("OWNER", "REPO", "main")
 
 		opts := &ViewOptions{
 			Web: true,
@@ -198,6 +205,24 @@ func Test_ViewRun(t *testing.T) {
 
 
 				View this repository on GitHub: https://github.com/jill/valentine
+			`),
+		},
+		{
+			name: "branch arg",
+			opts: &ViewOptions{
+				Branch: "feat/awesome",
+			},
+			stdoutTTY: true,
+			wantOut: heredoc.Doc(`
+				OWNER/REPO
+				social distancing
+
+
+				  # truly cool readme check it out                                            
+
+
+
+				View this repository on GitHub: https://github.com/OWNER/REPO
 			`),
 		},
 		{
@@ -465,6 +490,135 @@ func Test_ViewRun_NoDescription(t *testing.T) {
 			}
 			assert.Equal(t, tt.wantOut, stdout.String())
 			assert.Equal(t, "", stderr.String())
+			reg.Verify(t)
+		})
+	}
+}
+
+func Test_ViewRun_WithoutUsername(t *testing.T) {
+	reg := &httpmock.Registry{}
+	reg.Register(
+		httpmock.GraphQL(`query UserCurrent\b`),
+		httpmock.StringResponse(`
+		{ "data": { "viewer": {
+			"login": "OWNER"
+		}}}`))
+	reg.Register(
+		httpmock.GraphQL(`query RepositoryInfo\b`),
+		httpmock.StringResponse(`
+	{ "data": {
+		"repository": {
+		"description": "social distancing"
+	} } }`))
+	reg.Register(
+		httpmock.REST("GET", "repos/OWNER/REPO/readme"),
+		httpmock.StringResponse(`
+	{ "name": "readme.md",
+	"content": "IyB0cnVseSBjb29sIHJlYWRtZSBjaGVjayBpdCBvdXQ="}`))
+
+	io, _, stdout, stderr := iostreams.Test()
+	io.SetStdoutTTY(false)
+
+	opts := &ViewOptions{
+		RepoArg: "REPO",
+		HttpClient: func() (*http.Client, error) {
+			return &http.Client{Transport: reg}, nil
+		},
+		IO: io,
+	}
+
+	if err := viewRun(opts); err != nil {
+		t.Errorf("viewRun() error = %v", err)
+	}
+
+	assert.Equal(t, heredoc.Doc(`
+			name:	OWNER/REPO
+			description:	social distancing
+			--
+			# truly cool readme check it out
+			`), stdout.String())
+	assert.Equal(t, "", stderr.String())
+	reg.Verify(t)
+}
+
+func Test_ViewRun_HandlesSpecialCharacters(t *testing.T) {
+	tests := []struct {
+		name       string
+		opts       *ViewOptions
+		repoName   string
+		stdoutTTY  bool
+		wantOut    string
+		wantStderr string
+		wantErr    bool
+	}{
+		{
+			name: "nontty",
+			wantOut: heredoc.Doc(`
+				name:	OWNER/REPO
+				description:	Some basic special characters " & / < > '
+				--
+				# < is always > than & ' and "
+				`),
+		},
+		{
+			name:      "no args",
+			stdoutTTY: true,
+			wantOut: heredoc.Doc(`
+				OWNER/REPO
+				Some basic special characters " & / < > '
+
+
+				  # < is always > than & ' and "                                              
+
+
+
+				View this repository on GitHub: https://github.com/OWNER/REPO
+			`),
+		},
+	}
+	for _, tt := range tests {
+		if tt.opts == nil {
+			tt.opts = &ViewOptions{}
+		}
+
+		if tt.repoName == "" {
+			tt.repoName = "OWNER/REPO"
+		}
+
+		tt.opts.BaseRepo = func() (ghrepo.Interface, error) {
+			repo, _ := ghrepo.FromFullName(tt.repoName)
+			return repo, nil
+		}
+
+		reg := &httpmock.Registry{}
+		reg.Register(
+			httpmock.GraphQL(`query RepositoryInfo\b`),
+			httpmock.StringResponse(`
+		{ "data": {
+			"repository": {
+			"description": "Some basic special characters \" & / < > '"
+		} } }`))
+		reg.Register(
+			httpmock.REST("GET", fmt.Sprintf("repos/%s/readme", tt.repoName)),
+			httpmock.StringResponse(`
+		{ "name": "readme.md",
+		"content": "IyA8IGlzIGFsd2F5cyA+IHRoYW4gJiAnIGFuZCAi"}`))
+
+		tt.opts.HttpClient = func() (*http.Client, error) {
+			return &http.Client{Transport: reg}, nil
+		}
+
+		io, _, stdout, stderr := iostreams.Test()
+		tt.opts.IO = io
+
+		t.Run(tt.name, func(t *testing.T) {
+			io.SetStdoutTTY(tt.stdoutTTY)
+
+			if err := viewRun(tt.opts); (err != nil) != tt.wantErr {
+				t.Errorf("viewRun() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			assert.Equal(t, tt.wantStderr, stderr.String())
+			assert.Equal(t, tt.wantOut, stdout.String())
 			reg.Verify(t)
 		})
 	}

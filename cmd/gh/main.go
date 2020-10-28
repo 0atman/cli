@@ -10,6 +10,7 @@ import (
 	"path"
 	"strings"
 
+	surveyCore "github.com/AlecAivazis/survey/v2/core"
 	"github.com/cli/cli/api"
 	"github.com/cli/cli/command"
 	"github.com/cli/cli/internal/config"
@@ -43,7 +44,38 @@ func main() {
 
 	cmdFactory := factory.New(command.Version)
 	stderr := cmdFactory.IOStreams.ErrOut
+	if !cmdFactory.IOStreams.ColorEnabled() {
+		surveyCore.DisableColor = true
+	} else {
+		// override survey's poor choice of color
+		surveyCore.TemplateFuncsWithColor["color"] = func(style string) string {
+			switch style {
+			case "white":
+				if cmdFactory.IOStreams.ColorSupport256() {
+					return fmt.Sprintf("\x1b[%d;5;%dm", 38, 242)
+				}
+				return ansi.ColorCode("default")
+			default:
+				return ansi.ColorCode(style)
+			}
+		}
+	}
+
 	rootCmd := root.NewCmdRoot(cmdFactory, command.Version, command.BuildDate)
+
+	cfg, err := cmdFactory.Config()
+	if err != nil {
+		fmt.Fprintf(stderr, "failed to read configuration:  %s\n", err)
+		os.Exit(2)
+	}
+
+	if prompt, _ := cfg.Get("", "prompt"); prompt == config.PromptsDisabled {
+		cmdFactory.IOStreams.SetNeverPrompt(true)
+	}
+
+	if pager, _ := cfg.Get("", "pager"); pager != "" {
+		cmdFactory.IOStreams.SetPager(pager)
+	}
 
 	expandedArgs := []string{}
 	if len(os.Args) > 0 {
@@ -54,12 +86,6 @@ func main() {
 	if err != nil || cmd == rootCmd {
 		originalArgs := expandedArgs
 		isShell := false
-
-		cfg, err := cmdFactory.Config()
-		if err != nil {
-			fmt.Fprintf(stderr, "failed to read configuration:  %s\n", err)
-			os.Exit(2)
-		}
 
 		expandedArgs, isShell, err = expand.ExpandAlias(cfg, os.Args, nil)
 		if err != nil {
@@ -92,23 +118,11 @@ func main() {
 		}
 	}
 
-	authCheckEnabled := cmdutil.IsAuthCheckEnabled(cmd)
-
-	// TODO support other names
-	ghtoken := os.Getenv("GITHUB_TOKEN")
-	if ghtoken != "" {
-		authCheckEnabled = false
-	}
-
+	authCheckEnabled := os.Getenv("GITHUB_TOKEN") == "" &&
+		os.Getenv("GITHUB_ENTERPRISE_TOKEN") == "" &&
+		cmd != nil && cmdutil.IsAuthCheckEnabled(cmd)
 	if authCheckEnabled {
-		hasAuth := false
-
-		cfg, err := cmdFactory.Config()
-		if err == nil {
-			hasAuth = cmdutil.CheckAuth(cfg)
-		}
-
-		if !hasAuth {
+		if !cmdutil.CheckAuth(cfg) {
 			fmt.Fprintln(stderr, utils.Bold("Welcome to GitHub CLI!"))
 			fmt.Fprintln(stderr)
 			fmt.Fprintln(stderr, "To authenticate, please run `gh auth login`.")
