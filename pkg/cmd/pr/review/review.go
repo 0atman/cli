@@ -7,16 +7,14 @@ import (
 
 	"github.com/AlecAivazis/survey/v2"
 	"github.com/MakeNowJust/heredoc"
-	"github.com/cli/cli/api"
-	"github.com/cli/cli/context"
-	"github.com/cli/cli/internal/config"
-	"github.com/cli/cli/internal/ghrepo"
-	"github.com/cli/cli/pkg/cmd/pr/shared"
-	"github.com/cli/cli/pkg/cmdutil"
-	"github.com/cli/cli/pkg/iostreams"
-	"github.com/cli/cli/pkg/prompt"
-	"github.com/cli/cli/pkg/surveyext"
-	"github.com/cli/cli/utils"
+	"github.com/cli/cli/v2/api"
+	"github.com/cli/cli/v2/internal/config"
+	"github.com/cli/cli/v2/pkg/cmd/pr/shared"
+	"github.com/cli/cli/v2/pkg/cmdutil"
+	"github.com/cli/cli/v2/pkg/iostreams"
+	"github.com/cli/cli/v2/pkg/markdown"
+	"github.com/cli/cli/v2/pkg/prompt"
+	"github.com/cli/cli/v2/pkg/surveyext"
 	"github.com/spf13/cobra"
 )
 
@@ -24,9 +22,8 @@ type ReviewOptions struct {
 	HttpClient func() (*http.Client, error)
 	Config     func() (config.Config, error)
 	IO         *iostreams.IOStreams
-	BaseRepo   func() (ghrepo.Interface, error)
-	Remotes    func() (context.Remotes, error)
-	Branch     func() (string, error)
+
+	Finder shared.PRFinder
 
 	SelectorArg     string
 	InteractiveMode bool
@@ -39,8 +36,6 @@ func NewCmdReview(f *cmdutil.Factory, runF func(*ReviewOptions) error) *cobra.Co
 		IO:         f.IOStreams,
 		HttpClient: f.HttpClient,
 		Config:     f.Config,
-		Remotes:    f.Remotes,
-		Branch:     f.Branch,
 	}
 
 	var (
@@ -48,6 +43,8 @@ func NewCmdReview(f *cmdutil.Factory, runF func(*ReviewOptions) error) *cobra.Co
 		flagRequestChanges bool
 		flagComment        bool
 	)
+
+	var bodyFile string
 
 	cmd := &cobra.Command{
 		Use:   "review [<number> | <url> | <branch>]",
@@ -60,27 +57,44 @@ func NewCmdReview(f *cmdutil.Factory, runF func(*ReviewOptions) error) *cobra.Co
 		Example: heredoc.Doc(`
 			# approve the pull request of the current branch
 			$ gh pr review --approve
-			
+
 			# leave a review comment for the current branch
 			$ gh pr review --comment -b "interesting"
-			
+
 			# add a review for a specific pull request
 			$ gh pr review 123
-			
+
 			# request changes on a specific pull request
 			$ gh pr review 123 -r -b "needs more ASCII art"
 		`),
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			// support `-R, --repo` override
-			opts.BaseRepo = f.BaseRepo
+			opts.Finder = shared.NewFinder(f)
 
 			if repoOverride, _ := cmd.Flags().GetString("repo"); repoOverride != "" && len(args) == 0 {
-				return &cmdutil.FlagError{Err: errors.New("argument required when using the --repo flag")}
+				return cmdutil.FlagErrorf("argument required when using the --repo flag")
 			}
 
 			if len(args) > 0 {
 				opts.SelectorArg = args[0]
+			}
+
+			bodyProvided := cmd.Flags().Changed("body")
+			bodyFileProvided := bodyFile != ""
+
+			if err := cmdutil.MutuallyExclusive(
+				"specify only one of `--body` or `--body-file`",
+				bodyProvided,
+				bodyFileProvided,
+			); err != nil {
+				return err
+			}
+			if bodyFileProvided {
+				b, err := cmdutil.ReadFile(bodyFile, opts.IO.In)
+				if err != nil {
+					return err
+				}
+				opts.Body = string(b)
 			}
 
 			found := 0
@@ -92,26 +106,26 @@ func NewCmdReview(f *cmdutil.Factory, runF func(*ReviewOptions) error) *cobra.Co
 				found++
 				opts.ReviewType = api.ReviewRequestChanges
 				if opts.Body == "" {
-					return &cmdutil.FlagError{Err: errors.New("body cannot be blank for request-changes review")}
+					return cmdutil.FlagErrorf("body cannot be blank for request-changes review")
 				}
 			}
 			if flagComment {
 				found++
 				opts.ReviewType = api.ReviewComment
 				if opts.Body == "" {
-					return &cmdutil.FlagError{Err: errors.New("body cannot be blank for comment review")}
+					return cmdutil.FlagErrorf("body cannot be blank for comment review")
 				}
 			}
 
 			if found == 0 && opts.Body == "" {
 				if !opts.IO.CanPrompt() {
-					return &cmdutil.FlagError{Err: errors.New("--approve, --request-changes, or --comment required when not running interactively")}
+					return cmdutil.FlagErrorf("--approve, --request-changes, or --comment required when not running interactively")
 				}
 				opts.InteractiveMode = true
 			} else if found == 0 && opts.Body != "" {
-				return &cmdutil.FlagError{Err: errors.New("--body unsupported without --approve, --request-changes, or --comment")}
+				return cmdutil.FlagErrorf("--body unsupported without --approve, --request-changes, or --comment")
 			} else if found > 1 {
-				return &cmdutil.FlagError{Err: errors.New("need exactly one of --approve, --request-changes, or --comment")}
+				return cmdutil.FlagErrorf("need exactly one of --approve, --request-changes, or --comment")
 			}
 
 			if runF != nil {
@@ -125,18 +139,17 @@ func NewCmdReview(f *cmdutil.Factory, runF func(*ReviewOptions) error) *cobra.Co
 	cmd.Flags().BoolVarP(&flagRequestChanges, "request-changes", "r", false, "Request changes on a pull request")
 	cmd.Flags().BoolVarP(&flagComment, "comment", "c", false, "Comment on a pull request")
 	cmd.Flags().StringVarP(&opts.Body, "body", "b", "", "Specify the body of a review")
+	cmd.Flags().StringVarP(&bodyFile, "body-file", "F", "", "Read body text from `file` (use \"-\" to read from standard input)")
 
 	return cmd
 }
 
 func reviewRun(opts *ReviewOptions) error {
-	httpClient, err := opts.HttpClient()
-	if err != nil {
-		return err
+	findOptions := shared.FindOptions{
+		Selector: opts.SelectorArg,
+		Fields:   []string{"id", "number"},
 	}
-	apiClient := api.NewClientFromHTTP(httpClient)
-
-	pr, baseRepo, err := shared.PRFromArgs(apiClient, opts.BaseRepo, opts.Branch, opts.Remotes, opts.SelectorArg)
+	pr, baseRepo, err := opts.Finder.Find(findOptions)
 	if err != nil {
 		return err
 	}
@@ -162,6 +175,12 @@ func reviewRun(opts *ReviewOptions) error {
 		}
 	}
 
+	httpClient, err := opts.HttpClient()
+	if err != nil {
+		return err
+	}
+	apiClient := api.NewClientFromHTTP(httpClient)
+
 	err = api.AddReview(apiClient, baseRepo, pr, reviewData)
 	if err != nil {
 		return fmt.Errorf("failed to create review: %w", err)
@@ -171,13 +190,15 @@ func reviewRun(opts *ReviewOptions) error {
 		return nil
 	}
 
+	cs := opts.IO.ColorScheme()
+
 	switch reviewData.State {
 	case api.ReviewComment:
-		fmt.Fprintf(opts.IO.ErrOut, "%s Reviewed pull request #%d\n", utils.Gray("-"), pr.Number)
+		fmt.Fprintf(opts.IO.ErrOut, "%s Reviewed pull request #%d\n", cs.Gray("-"), pr.Number)
 	case api.ReviewApprove:
-		fmt.Fprintf(opts.IO.ErrOut, "%s Approved pull request #%d\n", utils.Green("✓"), pr.Number)
+		fmt.Fprintf(opts.IO.ErrOut, "%s Approved pull request #%d\n", cs.SuccessIcon(), pr.Number)
 	case api.ReviewRequestChanges:
-		fmt.Fprintf(opts.IO.ErrOut, "%s Requested changes to pull request #%d\n", utils.Red("+"), pr.Number)
+		fmt.Fprintf(opts.IO.ErrOut, "%s Requested changes to pull request #%d\n", cs.Red("+"), pr.Number)
 	}
 
 	return nil
@@ -252,7 +273,7 @@ func reviewSurvey(io *iostreams.IOStreams, editorCommand string) (*api.PullReque
 	}
 
 	if len(bodyAnswers.Body) > 0 {
-		renderedBody, err := utils.RenderMarkdown(bodyAnswers.Body)
+		renderedBody, err := markdown.Render(bodyAnswers.Body, markdown.WithIO(io))
 		if err != nil {
 			return nil, err
 		}

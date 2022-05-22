@@ -1,29 +1,39 @@
 package root
 
 import (
-	"fmt"
 	"net/http"
-	"regexp"
-	"strings"
+	"os"
+	"sync"
 
 	"github.com/MakeNowJust/heredoc"
-	"github.com/cli/cli/api"
-	"github.com/cli/cli/context"
-	"github.com/cli/cli/internal/ghrepo"
-	aliasCmd "github.com/cli/cli/pkg/cmd/alias"
-	apiCmd "github.com/cli/cli/pkg/cmd/api"
-	authCmd "github.com/cli/cli/pkg/cmd/auth"
-	configCmd "github.com/cli/cli/pkg/cmd/config"
-	"github.com/cli/cli/pkg/cmd/factory"
-	gistCmd "github.com/cli/cli/pkg/cmd/gist"
-	issueCmd "github.com/cli/cli/pkg/cmd/issue"
-	prCmd "github.com/cli/cli/pkg/cmd/pr"
-	releaseCmd "github.com/cli/cli/pkg/cmd/release"
-	repoCmd "github.com/cli/cli/pkg/cmd/repo"
-	creditsCmd "github.com/cli/cli/pkg/cmd/repo/credits"
-	"github.com/cli/cli/pkg/cmdutil"
+	codespacesAPI "github.com/cli/cli/v2/internal/codespaces/api"
+	actionsCmd "github.com/cli/cli/v2/pkg/cmd/actions"
+	aliasCmd "github.com/cli/cli/v2/pkg/cmd/alias"
+	apiCmd "github.com/cli/cli/v2/pkg/cmd/api"
+	authCmd "github.com/cli/cli/v2/pkg/cmd/auth"
+	browseCmd "github.com/cli/cli/v2/pkg/cmd/browse"
+	codespaceCmd "github.com/cli/cli/v2/pkg/cmd/codespace"
+	completionCmd "github.com/cli/cli/v2/pkg/cmd/completion"
+	configCmd "github.com/cli/cli/v2/pkg/cmd/config"
+	extensionCmd "github.com/cli/cli/v2/pkg/cmd/extension"
+	"github.com/cli/cli/v2/pkg/cmd/factory"
+	gistCmd "github.com/cli/cli/v2/pkg/cmd/gist"
+	gpgKeyCmd "github.com/cli/cli/v2/pkg/cmd/gpg-key"
+	issueCmd "github.com/cli/cli/v2/pkg/cmd/issue"
+	labelCmd "github.com/cli/cli/v2/pkg/cmd/label"
+	prCmd "github.com/cli/cli/v2/pkg/cmd/pr"
+	releaseCmd "github.com/cli/cli/v2/pkg/cmd/release"
+	repoCmd "github.com/cli/cli/v2/pkg/cmd/repo"
+	creditsCmd "github.com/cli/cli/v2/pkg/cmd/repo/credits"
+	runCmd "github.com/cli/cli/v2/pkg/cmd/run"
+	searchCmd "github.com/cli/cli/v2/pkg/cmd/search"
+	secretCmd "github.com/cli/cli/v2/pkg/cmd/secret"
+	sshKeyCmd "github.com/cli/cli/v2/pkg/cmd/ssh-key"
+	statusCmd "github.com/cli/cli/v2/pkg/cmd/status"
+	versionCmd "github.com/cli/cli/v2/pkg/cmd/version"
+	workflowCmd "github.com/cli/cli/v2/pkg/cmd/workflow"
+	"github.com/cli/cli/v2/pkg/cmdutil"
 	"github.com/spf13/cobra"
-	"github.com/spf13/pflag"
 )
 
 func NewCmdRoot(f *cmdutil.Factory, version, buildDate string) *cobra.Command {
@@ -41,115 +51,130 @@ func NewCmdRoot(f *cmdutil.Factory, version, buildDate string) *cobra.Command {
 		`),
 		Annotations: map[string]string{
 			"help:feedback": heredoc.Doc(`
-				Open an issue using 'gh issue create -R cli/cli'
-			`),
-			"help:environment": heredoc.Doc(`
-				See 'gh help environment' for the list of supported environment variables.
+				Open an issue using 'gh issue create -R github.com/cli/cli'
 			`),
 		},
 	}
-
-	version = strings.TrimPrefix(version, "v")
-	if buildDate == "" {
-		cmd.Version = version
-	} else {
-		cmd.Version = fmt.Sprintf("%s (%s)", version, buildDate)
-	}
-	versionOutput := fmt.Sprintf("gh version %s\n%s\n", cmd.Version, changelogURL(version))
-	cmd.AddCommand(&cobra.Command{
-		Use:    "version",
-		Hidden: true,
-		Run: func(cmd *cobra.Command, args []string) {
-			fmt.Print(versionOutput)
-		},
-	})
-	cmd.SetVersionTemplate(versionOutput)
-	cmd.Flags().Bool("version", false, "Show gh version")
 
 	cmd.SetOut(f.IOStreams.Out)
 	cmd.SetErr(f.IOStreams.ErrOut)
 
 	cmd.PersistentFlags().Bool("help", false, "Show help for command")
-	cmd.SetHelpFunc(rootHelpFunc)
-	cmd.SetUsageFunc(rootUsageFunc)
-
-	cmd.SetFlagErrorFunc(func(cmd *cobra.Command, err error) error {
-		if err == pflag.ErrHelp {
-			return err
-		}
-		return &cmdutil.FlagError{Err: err}
+	cmd.SetHelpFunc(func(cmd *cobra.Command, args []string) {
+		rootHelpFunc(f, cmd, args)
 	})
+	cmd.SetUsageFunc(rootUsageFunc)
+	cmd.SetFlagErrorFunc(rootFlagErrorFunc)
 
-	cmdutil.DisableAuthCheck(cmd)
+	formattedVersion := versionCmd.Format(version, buildDate)
+	cmd.SetVersionTemplate(formattedVersion)
+	cmd.Version = formattedVersion
+	cmd.Flags().Bool("version", false, "Show gh version")
 
 	// Child commands
+	cmd.AddCommand(versionCmd.NewCmdVersion(f, version, buildDate))
+	cmd.AddCommand(actionsCmd.NewCmdActions(f))
 	cmd.AddCommand(aliasCmd.NewCmdAlias(f))
 	cmd.AddCommand(authCmd.NewCmdAuth(f))
 	cmd.AddCommand(configCmd.NewCmdConfig(f))
 	cmd.AddCommand(creditsCmd.NewCmdCredits(f, nil))
 	cmd.AddCommand(gistCmd.NewCmdGist(f))
-	cmd.AddCommand(NewCmdCompletion(f.IOStreams))
-
-	// Help topics
-	cmd.AddCommand(NewHelpTopic("environment"))
+	cmd.AddCommand(gpgKeyCmd.NewCmdGPGKey(f))
+	cmd.AddCommand(completionCmd.NewCmdCompletion(f.IOStreams))
+	cmd.AddCommand(extensionCmd.NewCmdExtension(f))
+	cmd.AddCommand(searchCmd.NewCmdSearch(f))
+	cmd.AddCommand(secretCmd.NewCmdSecret(f))
+	cmd.AddCommand(sshKeyCmd.NewCmdSSHKey(f))
+	cmd.AddCommand(statusCmd.NewCmdStatus(f, nil))
+	cmd.AddCommand(newCodespaceCmd(f))
 
 	// the `api` command should not inherit any extra HTTP headers
 	bareHTTPCmdFactory := *f
-	bareHTTPCmdFactory.HttpClient = func() (*http.Client, error) {
-		cfg, err := bareHTTPCmdFactory.Config()
-		if err != nil {
-			return nil, err
-		}
-		return factory.NewHTTPClient(bareHTTPCmdFactory.IOStreams, cfg, version, false), nil
-	}
+	bareHTTPCmdFactory.HttpClient = bareHTTPClient(f, version)
 
 	cmd.AddCommand(apiCmd.NewCmdApi(&bareHTTPCmdFactory, nil))
 
 	// below here at the commands that require the "intelligent" BaseRepo resolver
 	repoResolvingCmdFactory := *f
-	repoResolvingCmdFactory.BaseRepo = resolvedBaseRepo(f)
+	repoResolvingCmdFactory.BaseRepo = factory.SmartBaseRepoFunc(f)
 
+	cmd.AddCommand(browseCmd.NewCmdBrowse(&repoResolvingCmdFactory, nil))
 	cmd.AddCommand(prCmd.NewCmdPR(&repoResolvingCmdFactory))
 	cmd.AddCommand(issueCmd.NewCmdIssue(&repoResolvingCmdFactory))
 	cmd.AddCommand(releaseCmd.NewCmdRelease(&repoResolvingCmdFactory))
 	cmd.AddCommand(repoCmd.NewCmdRepo(&repoResolvingCmdFactory))
+	cmd.AddCommand(runCmd.NewCmdRun(&repoResolvingCmdFactory))
+	cmd.AddCommand(workflowCmd.NewCmdWorkflow(&repoResolvingCmdFactory))
+	cmd.AddCommand(labelCmd.NewCmdLabel(&repoResolvingCmdFactory))
 
+	// Help topics
+	cmd.AddCommand(NewHelpTopic("environment"))
+	cmd.AddCommand(NewHelpTopic("formatting"))
+	cmd.AddCommand(NewHelpTopic("mintty"))
+	referenceCmd := NewHelpTopic("reference")
+	referenceCmd.SetHelpFunc(referenceHelpFn(f.IOStreams))
+	cmd.AddCommand(referenceCmd)
+
+	cmdutil.DisableAuthCheck(cmd)
+
+	// this needs to appear last:
+	referenceCmd.Long = referenceLong(cmd)
 	return cmd
 }
 
-func resolvedBaseRepo(f *cmdutil.Factory) func() (ghrepo.Interface, error) {
-	return func() (ghrepo.Interface, error) {
-		httpClient, err := f.HttpClient()
+func bareHTTPClient(f *cmdutil.Factory, version string) func() (*http.Client, error) {
+	return func() (*http.Client, error) {
+		cfg, err := f.Config()
 		if err != nil {
 			return nil, err
 		}
-
-		apiClient := api.NewClientFromHTTP(httpClient)
-
-		remotes, err := f.Remotes()
-		if err != nil {
-			return nil, err
-		}
-		repoContext, err := context.ResolveRemotesToRepos(remotes, apiClient, "")
-		if err != nil {
-			return nil, err
-		}
-		baseRepo, err := repoContext.BaseRepo(f.IOStreams)
-		if err != nil {
-			return nil, err
-		}
-
-		return baseRepo, nil
+		return factory.NewHTTPClient(f.IOStreams, cfg, version, false)
 	}
 }
 
-func changelogURL(version string) string {
-	path := "https://github.com/cli/cli"
-	r := regexp.MustCompile(`^v?\d+\.\d+\.\d+(-[\w.]+)?$`)
-	if !r.MatchString(version) {
-		return fmt.Sprintf("%s/releases/latest", path)
+func newCodespaceCmd(f *cmdutil.Factory) *cobra.Command {
+	serverURL := os.Getenv("GITHUB_SERVER_URL")
+	apiURL := os.Getenv("GITHUB_API_URL")
+	vscsURL := os.Getenv("INTERNAL_VSCS_TARGET_URL")
+	app := codespaceCmd.NewApp(
+		f.IOStreams,
+		f,
+		codespacesAPI.New(
+			serverURL,
+			apiURL,
+			vscsURL,
+			&lazyLoadedHTTPClient{factory: f},
+		),
+		f.Browser,
+	)
+	cmd := codespaceCmd.NewRootCmd(app)
+	cmd.Use = "codespace"
+	cmd.Aliases = []string{"cs"}
+	cmd.Annotations = map[string]string{"IsCore": "true"}
+	return cmd
+}
+
+type lazyLoadedHTTPClient struct {
+	factory *cmdutil.Factory
+
+	httpClientMu sync.RWMutex // guards httpClient
+	httpClient   *http.Client
+}
+
+func (l *lazyLoadedHTTPClient) Do(req *http.Request) (*http.Response, error) {
+	l.httpClientMu.RLock()
+	httpClient := l.httpClient
+	l.httpClientMu.RUnlock()
+
+	if httpClient == nil {
+		var err error
+		l.httpClientMu.Lock()
+		l.httpClient, err = l.factory.HttpClient()
+		l.httpClientMu.Unlock()
+		if err != nil {
+			return nil, err
+		}
 	}
 
-	url := fmt.Sprintf("%s/releases/tag/v%s", path, strings.TrimPrefix(version, "v"))
-	return url
+	return l.httpClient.Do(req)
 }

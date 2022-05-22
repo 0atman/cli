@@ -2,21 +2,31 @@ package iostreams
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/briandowns/spinner"
+	"github.com/cli/safeexec"
 	"github.com/google/shlex"
 	"github.com/mattn/go-colorable"
 	"github.com/mattn/go-isatty"
-	"golang.org/x/crypto/ssh/terminal"
+	"github.com/muesli/termenv"
+	"golang.org/x/term"
 )
+
+const DefaultWidth = 80
+
+// ErrClosedPagerPipe is the error returned when writing to a pager that has been closed.
+type ErrClosedPagerPipe struct {
+	error
+}
 
 type IOStreams struct {
 	In     io.ReadCloser
@@ -24,12 +34,15 @@ type IOStreams struct {
 	ErrOut io.Writer
 
 	// the original (non-colorable) output stream
-	originalOut  io.Writer
-	colorEnabled bool
-	is256enabled bool
+	originalOut   io.Writer
+	colorEnabled  bool
+	is256enabled  bool
+	hasTrueColor  bool
+	terminalTheme string
 
 	progressIndicatorEnabled bool
 	progressIndicator        *spinner.Spinner
+	progressIndicatorMu      sync.Mutex
 
 	stdinTTYOverride  bool
 	stdinIsTTY        bool
@@ -37,11 +50,15 @@ type IOStreams struct {
 	stdoutIsTTY       bool
 	stderrTTYOverride bool
 	stderrIsTTY       bool
+	termWidthOverride int
+	ttySize           func() (int, int, error)
 
 	pagerCommand string
 	pagerProcess *os.Process
 
 	neverPrompt bool
+
+	TempFileOverride *os.File
 }
 
 func (s *IOStreams) ColorEnabled() bool {
@@ -50,6 +67,50 @@ func (s *IOStreams) ColorEnabled() bool {
 
 func (s *IOStreams) ColorSupport256() bool {
 	return s.is256enabled
+}
+
+func (s *IOStreams) HasTrueColor() bool {
+	return s.hasTrueColor
+}
+
+// DetectTerminalTheme is a utility to call before starting the output pager so that the terminal background
+// can be reliably detected.
+func (s *IOStreams) DetectTerminalTheme() {
+	if !s.ColorEnabled() {
+		s.terminalTheme = "none"
+		return
+	}
+
+	if s.pagerProcess != nil {
+		s.terminalTheme = "none"
+		return
+	}
+
+	style := os.Getenv("GLAMOUR_STYLE")
+	if style != "" && style != "auto" {
+		s.terminalTheme = "none"
+		return
+	}
+
+	if termenv.HasDarkBackground() {
+		s.terminalTheme = "dark"
+		return
+	}
+
+	s.terminalTheme = "light"
+}
+
+// TerminalTheme returns "light", "dark", or "none" depending on the background color of the terminal.
+func (s *IOStreams) TerminalTheme() string {
+	if s.terminalTheme == "" {
+		s.DetectTerminalTheme()
+	}
+
+	return s.terminalTheme
+}
+
+func (s *IOStreams) SetColorEnabled(colorEnabled bool) {
+	s.colorEnabled = colorEnabled
 }
 
 func (s *IOStreams) SetStdinTTY(isTTY bool) {
@@ -101,8 +162,12 @@ func (s *IOStreams) SetPager(cmd string) {
 	s.pagerCommand = cmd
 }
 
+func (s *IOStreams) GetPager() string {
+	return s.pagerCommand
+}
+
 func (s *IOStreams) StartPager() error {
-	if s.pagerCommand == "" || !s.IsStdoutTTY() {
+	if s.pagerCommand == "" || s.pagerCommand == "cat" || !s.IsStdoutTTY() {
 		return nil
 	}
 
@@ -124,7 +189,11 @@ func (s *IOStreams) StartPager() error {
 		pagerEnv = append(pagerEnv, "LV=-c")
 	}
 
-	pagerCmd := exec.Command(pagerArgs[0], pagerArgs[1:]...)
+	pagerExe, err := safeexec.LookPath(pagerArgs[0])
+	if err != nil {
+		return err
+	}
+	pagerCmd := exec.Command(pagerExe, pagerArgs[1:]...)
 	pagerCmd.Env = pagerEnv
 	pagerCmd.Stdout = s.Out
 	pagerCmd.Stderr = s.ErrOut
@@ -132,7 +201,7 @@ func (s *IOStreams) StartPager() error {
 	if err != nil {
 		return err
 	}
-	s.Out = pagedOut
+	s.Out = &pagerWriter{pagedOut}
 	err = pagerCmd.Start()
 	if err != nil {
 		return err
@@ -146,7 +215,7 @@ func (s *IOStreams) StopPager() {
 		return
 	}
 
-	s.Out.(io.ReadCloser).Close()
+	_ = s.Out.(io.WriteCloser).Close()
 	_, _ = s.pagerProcess.Wait()
 	s.pagerProcess = nil
 }
@@ -159,20 +228,49 @@ func (s *IOStreams) CanPrompt() bool {
 	return s.IsStdinTTY() && s.IsStdoutTTY()
 }
 
+func (s *IOStreams) GetNeverPrompt() bool {
+	return s.neverPrompt
+}
+
 func (s *IOStreams) SetNeverPrompt(v bool) {
 	s.neverPrompt = v
 }
 
 func (s *IOStreams) StartProgressIndicator() {
+	s.StartProgressIndicatorWithLabel("")
+}
+
+func (s *IOStreams) StartProgressIndicatorWithLabel(label string) {
 	if !s.progressIndicatorEnabled {
 		return
 	}
-	sp := spinner.New(spinner.CharSets[11], 400*time.Millisecond, spinner.WithWriter(s.ErrOut))
+
+	s.progressIndicatorMu.Lock()
+	defer s.progressIndicatorMu.Unlock()
+
+	if s.progressIndicator != nil {
+		if label == "" {
+			s.progressIndicator.Prefix = ""
+		} else {
+			s.progressIndicator.Prefix = label + " "
+		}
+		return
+	}
+
+	// https://github.com/briandowns/spinner#available-character-sets
+	dotStyle := spinner.CharSets[11]
+	sp := spinner.New(dotStyle, 120*time.Millisecond, spinner.WithWriter(s.ErrOut), spinner.WithColor("fgCyan"))
+	if label != "" {
+		sp.Prefix = label + " "
+	}
+
 	sp.Start()
 	s.progressIndicator = sp
 }
 
 func (s *IOStreams) StopProgressIndicator() {
+	s.progressIndicatorMu.Lock()
+	defer s.progressIndicatorMu.Unlock()
 	if s.progressIndicator == nil {
 		return
 	}
@@ -180,8 +278,14 @@ func (s *IOStreams) StopProgressIndicator() {
 	s.progressIndicator = nil
 }
 
+// TerminalWidth returns the width of the terminal that stdout is attached to.
+// TODO: investigate whether ProcessTerminalWidth could replace all this.
 func (s *IOStreams) TerminalWidth() int {
-	defaultWidth := 80
+	if s.termWidthOverride > 0 {
+		return s.termWidthOverride
+	}
+
+	defaultWidth := DefaultWidth
 	out := s.Out
 	if s.originalOut != nil {
 		out = s.originalOut
@@ -192,7 +296,11 @@ func (s *IOStreams) TerminalWidth() int {
 	}
 
 	if isCygwinTerminal(out) {
-		tputCmd := exec.Command("tput", "cols")
+		tputExe, err := safeexec.LookPath("tput")
+		if err != nil {
+			return defaultWidth
+		}
+		tputCmd := exec.Command(tputExe, "cols")
 		tputCmd.Stdin = os.Stdin
 		if out, err := tputCmd.Output(); err == nil {
 			if w, err := strconv.Atoi(strings.TrimSpace(string(out))); err == nil {
@@ -204,13 +312,73 @@ func (s *IOStreams) TerminalWidth() int {
 	return defaultWidth
 }
 
+// ProcessTerminalWidth returns the width of the terminal that the process is attached to.
+func (s *IOStreams) ProcessTerminalWidth() int {
+	w, _, err := s.ttySize()
+	if err != nil {
+		return DefaultWidth
+	}
+	return w
+}
+
+func (s *IOStreams) ForceTerminal(spec string) {
+	s.colorEnabled = !EnvColorDisabled()
+	s.SetStdoutTTY(true)
+
+	if w, err := strconv.Atoi(spec); err == nil {
+		s.termWidthOverride = w
+		return
+	}
+
+	ttyWidth, _, err := s.ttySize()
+	if err != nil {
+		return
+	}
+	s.termWidthOverride = ttyWidth
+
+	if strings.HasSuffix(spec, "%") {
+		if p, err := strconv.Atoi(spec[:len(spec)-1]); err == nil {
+			s.termWidthOverride = int(float64(s.termWidthOverride) * (float64(p) / 100))
+		}
+	}
+}
+
 func (s *IOStreams) ColorScheme() *ColorScheme {
-	return NewColorScheme(s.ColorEnabled(), s.ColorSupport256())
+	return NewColorScheme(s.ColorEnabled(), s.ColorSupport256(), s.HasTrueColor())
+}
+
+func (s *IOStreams) ReadUserFile(fn string) ([]byte, error) {
+	var r io.ReadCloser
+	if fn == "-" {
+		r = s.In
+	} else {
+		var err error
+		r, err = os.Open(fn)
+		if err != nil {
+			return nil, err
+		}
+	}
+	defer r.Close()
+	return io.ReadAll(r)
+}
+
+func (s *IOStreams) TempFile(dir, pattern string) (*os.File, error) {
+	if s.TempFileOverride != nil {
+		return s.TempFileOverride, nil
+	}
+	return os.CreateTemp(dir, pattern)
 }
 
 func System() *IOStreams {
 	stdoutIsTTY := isTerminal(os.Stdout)
 	stderrIsTTY := isTerminal(os.Stderr)
+
+	assumeTrueColor := false
+	if stdoutIsTTY {
+		if err := enableVirtualTerminalProcessing(os.Stdout); err == nil {
+			assumeTrueColor = true
+		}
+	}
 
 	io := &IOStreams{
 		In:           os.Stdin,
@@ -218,8 +386,10 @@ func System() *IOStreams {
 		Out:          colorable.NewColorable(os.Stdout),
 		ErrOut:       colorable.NewColorable(os.Stderr),
 		colorEnabled: EnvColorForced() || (!EnvColorDisabled() && stdoutIsTTY),
-		is256enabled: Is256ColorSupported(),
+		is256enabled: assumeTrueColor || Is256ColorSupported(),
+		hasTrueColor: assumeTrueColor || IsTrueColorSupported(),
 		pagerCommand: os.Getenv("PAGER"),
+		ttySize:      ttySize,
 	}
 
 	if stdoutIsTTY && stderrIsTTY {
@@ -237,9 +407,12 @@ func Test() (*IOStreams, *bytes.Buffer, *bytes.Buffer, *bytes.Buffer) {
 	out := &bytes.Buffer{}
 	errOut := &bytes.Buffer{}
 	return &IOStreams{
-		In:     ioutil.NopCloser(in),
+		In:     io.NopCloser(in),
 		Out:    out,
 		ErrOut: errOut,
+		ttySize: func() (int, int, error) {
+			return -1, -1, errors.New("ttySize not implemented in tests")
+		},
 	}, in, out, errOut
 }
 
@@ -254,9 +427,23 @@ func isCygwinTerminal(w io.Writer) bool {
 	return false
 }
 
+// terminalSize measures the viewport of the terminal that the output stream is connected to
 func terminalSize(w io.Writer) (int, int, error) {
 	if f, isFile := w.(*os.File); isFile {
-		return terminal.GetSize(int(f.Fd()))
+		return term.GetSize(int(f.Fd()))
 	}
 	return 0, 0, fmt.Errorf("%v is not a file", w)
+}
+
+// pagerWriter implements a WriteCloser that wraps all EPIPE errors in an ErrClosedPagerPipe type.
+type pagerWriter struct {
+	io.WriteCloser
+}
+
+func (w *pagerWriter) Write(d []byte) (int, error) {
+	n, err := w.WriteCloser.Write(d)
+	if err != nil && (errors.Is(err, io.ErrClosedPipe) || isEpipeError(err)) {
+		return n, &ErrClosedPagerPipe{err}
+	}
+	return n, err
 }

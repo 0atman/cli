@@ -2,7 +2,7 @@ package githubtemplate
 
 import (
 	"fmt"
-	"io/ioutil"
+	"os"
 	"path"
 	"regexp"
 	"sort"
@@ -24,7 +24,7 @@ func FindNonLegacy(rootDir string, name string) []string {
 
 mainLoop:
 	for _, dir := range candidateDirs {
-		files, err := ioutil.ReadDir(dir)
+		files, err := os.ReadDir(dir)
 		if err != nil {
 			continue
 		}
@@ -32,7 +32,7 @@ mainLoop:
 		// detect multiple templates in a subdirectory
 		for _, file := range files {
 			if strings.EqualFold(file.Name(), name) && file.IsDir() {
-				templates, err := ioutil.ReadDir(path.Join(dir, file.Name()))
+				templates, err := os.ReadDir(path.Join(dir, file.Name()))
 				if err != nil {
 					break
 				}
@@ -53,7 +53,7 @@ mainLoop:
 }
 
 // FindLegacy returns the file path of the default(legacy) template
-func FindLegacy(rootDir string, name string) *string {
+func FindLegacy(rootDir string, name string) string {
 	namePattern := regexp.MustCompile(fmt.Sprintf(`(?i)^%s(\.|$)`, strings.ReplaceAll(name, "_", "[_-]")))
 
 	// https://help.github.com/en/github/building-a-strong-community/creating-a-pull-request-template-for-your-repository
@@ -63,7 +63,7 @@ func FindLegacy(rootDir string, name string) *string {
 		path.Join(rootDir, "docs"),
 	}
 	for _, dir := range candidateDirs {
-		files, err := ioutil.ReadDir(dir)
+		files, err := os.ReadDir(dir)
 		if err != nil {
 			continue
 		}
@@ -71,17 +71,16 @@ func FindLegacy(rootDir string, name string) *string {
 		// detect a single template file
 		for _, file := range files {
 			if namePattern.MatchString(file.Name()) && !file.IsDir() {
-				result := path.Join(dir, file.Name())
-				return &result
+				return path.Join(dir, file.Name())
 			}
 		}
 	}
-	return nil
+	return ""
 }
 
 // ExtractName returns the name of the template from YAML front-matter
 func ExtractName(filePath string) string {
-	contents, err := ioutil.ReadFile(filePath)
+	contents, err := os.ReadFile(filePath)
 	frontmatterBoundaries := detectFrontmatter(contents)
 	if err == nil && frontmatterBoundaries[0] == 0 {
 		templateData := struct {
@@ -96,7 +95,7 @@ func ExtractName(filePath string) string {
 
 // ExtractContents returns the template contents without the YAML front-matter
 func ExtractContents(filePath string) []byte {
-	contents, err := ioutil.ReadFile(filePath)
+	contents, err := os.ReadFile(filePath)
 	if err != nil {
 		return []byte{}
 	}

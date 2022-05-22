@@ -6,13 +6,12 @@ import (
 	"strings"
 
 	"github.com/MakeNowJust/heredoc"
-	"github.com/cli/cli/api"
-	"github.com/cli/cli/git"
-	"github.com/cli/cli/internal/config"
-	"github.com/cli/cli/internal/ghinstance"
-	"github.com/cli/cli/internal/ghrepo"
-	"github.com/cli/cli/pkg/cmdutil"
-	"github.com/cli/cli/pkg/iostreams"
+	"github.com/cli/cli/v2/api"
+	"github.com/cli/cli/v2/git"
+	"github.com/cli/cli/v2/internal/config"
+	"github.com/cli/cli/v2/internal/ghrepo"
+	"github.com/cli/cli/v2/pkg/cmdutil"
+	"github.com/cli/cli/v2/pkg/iostreams"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 )
@@ -23,7 +22,6 @@ type CloneOptions struct {
 	IO         *iostreams.IOStreams
 
 	GitArgs    []string
-	Directory  string
 	Repository string
 }
 
@@ -38,16 +36,18 @@ func NewCmdClone(f *cmdutil.Factory, runF func(*CloneOptions) error) *cobra.Comm
 		DisableFlagsInUseLine: true,
 
 		Use:   "clone <repository> [<directory>] [-- <gitflags>...]",
-		Args:  cobra.MinimumNArgs(1),
+		Args:  cmdutil.MinimumArgs(1, "cannot clone: repository argument required"),
 		Short: "Clone a repository locally",
-		Long: heredoc.Doc(`
-			Clone a GitHub repository locally.
+		Long: heredoc.Docf(`
+			Clone a GitHub repository locally. Pass additional %[1]sgit clone%[1]s flags by listing
+			them after "--".
 
 			If the "OWNER/" portion of the "OWNER/REPO" repository argument is omitted, it
 			defaults to the name of the authenticating user.
-			
-			Pass additional 'git clone' flags by listing them after '--'.
-		`),
+
+			If the repository is a fork, its parent repository will be added as an additional
+			git remote called "upstream".
+		`, "`"),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			opts.Repository = args[0]
 			opts.GitArgs = args[1:]
@@ -64,7 +64,7 @@ func NewCmdClone(f *cmdutil.Factory, runF func(*CloneOptions) error) *cobra.Comm
 		if err == pflag.ErrHelp {
 			return err
 		}
-		return &cmdutil.FlagError{Err: fmt.Errorf("%w\nSeparate git clone flags with '--'.", err)}
+		return cmdutil.FlagErrorf("%w\nSeparate git clone flags with '--'.", err)
 	})
 
 	return cmd
@@ -82,56 +82,89 @@ func cloneRun(opts *CloneOptions) error {
 	}
 
 	apiClient := api.NewClientFromHTTP(httpClient)
-	cloneURL := opts.Repository
-	if !strings.Contains(cloneURL, ":") {
-		if !strings.Contains(cloneURL, "/") {
-			currentUser, err := api.CurrentLoginName(apiClient, ghinstance.OverridableDefault())
+
+	repositoryIsURL := strings.Contains(opts.Repository, ":")
+	repositoryIsFullName := !repositoryIsURL && strings.Contains(opts.Repository, "/")
+
+	var repo ghrepo.Interface
+	var protocol string
+
+	if repositoryIsURL {
+		repoURL, err := git.ParseURL(opts.Repository)
+		if err != nil {
+			return err
+		}
+		repo, err = ghrepo.FromURL(repoURL)
+		if err != nil {
+			return err
+		}
+		if repoURL.Scheme == "git+ssh" {
+			repoURL.Scheme = "ssh"
+		}
+		protocol = repoURL.Scheme
+	} else {
+		var fullName string
+		if repositoryIsFullName {
+			fullName = opts.Repository
+		} else {
+			host, err := cfg.DefaultHost()
 			if err != nil {
 				return err
 			}
-			cloneURL = currentUser + "/" + cloneURL
+			currentUser, err := api.CurrentLoginName(apiClient, host)
+			if err != nil {
+				return err
+			}
+			fullName = currentUser + "/" + opts.Repository
 		}
-		repo, err := ghrepo.FromFullName(cloneURL)
+
+		repo, err = ghrepo.FromFullName(fullName)
 		if err != nil {
 			return err
 		}
 
-		protocol, err := cfg.Get(repo.RepoHost(), "git_protocol")
-		if err != nil {
-			return err
-		}
-		cloneURL = ghrepo.FormatRemoteURL(repo, protocol)
-	}
-
-	var repo ghrepo.Interface
-	var parentRepo ghrepo.Interface
-
-	// TODO: consider caching and reusing `git.ParseSSHConfig().Translator()`
-	// here to handle hostname aliases in SSH remotes
-	if u, err := git.ParseURL(cloneURL); err == nil {
-		repo, _ = ghrepo.FromURL(u)
-	}
-
-	if repo != nil {
-		parentRepo, err = api.RepoParent(apiClient, repo)
+		protocol, err = cfg.GetOrDefault(repo.RepoHost(), "git_protocol")
 		if err != nil {
 			return err
 		}
 	}
 
-	cloneDir, err := git.RunClone(cloneURL, opts.GitArgs)
+	wantsWiki := strings.HasSuffix(repo.RepoName(), ".wiki")
+	if wantsWiki {
+		repoName := strings.TrimSuffix(repo.RepoName(), ".wiki")
+		repo = ghrepo.NewWithHost(repo.RepoOwner(), repoName, repo.RepoHost())
+	}
+
+	// Load the repo from the API to get the username/repo name in its
+	// canonical capitalization
+	canonicalRepo, err := api.GitHubRepo(apiClient, repo)
+	if err != nil {
+		return err
+	}
+	canonicalCloneURL := ghrepo.FormatRemoteURL(canonicalRepo, protocol)
+
+	// If repo HasWikiEnabled and wantsWiki is true then create a new clone URL
+	if wantsWiki {
+		if !canonicalRepo.HasWikiEnabled {
+			return fmt.Errorf("The '%s' repository does not have a wiki", ghrepo.FullName(canonicalRepo))
+		}
+		canonicalCloneURL = strings.TrimSuffix(canonicalCloneURL, ".git") + ".wiki.git"
+	}
+
+	cloneDir, err := git.RunClone(canonicalCloneURL, opts.GitArgs)
 	if err != nil {
 		return err
 	}
 
-	if parentRepo != nil {
-		protocol, err := cfg.Get(parentRepo.RepoHost(), "git_protocol")
+	// If the repo is a fork, add the parent as an upstream
+	if canonicalRepo.Parent != nil {
+		protocol, err := cfg.GetOrDefault(canonicalRepo.Parent.RepoHost(), "git_protocol")
 		if err != nil {
 			return err
 		}
-		upstreamURL := ghrepo.FormatRemoteURL(parentRepo, protocol)
+		upstreamURL := ghrepo.FormatRemoteURL(canonicalRepo.Parent, protocol)
 
-		err = git.AddUpstreamRemote(upstreamURL, cloneDir)
+		err = git.AddUpstreamRemote(upstreamURL, cloneDir, []string{canonicalRepo.Parent.DefaultBranchRef.Name})
 		if err != nil {
 			return err
 		}

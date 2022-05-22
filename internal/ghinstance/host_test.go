@@ -2,30 +2,9 @@ package ghinstance
 
 import (
 	"testing"
+
+	"github.com/stretchr/testify/assert"
 )
-
-func TestOverridableDefault(t *testing.T) {
-	oldOverride := hostnameOverride
-	t.Cleanup(func() {
-		hostnameOverride = oldOverride
-	})
-
-	host := OverridableDefault()
-	if host != "github.com" {
-		t.Errorf("expected github.com, got %q", host)
-	}
-
-	OverrideDefault("example.org")
-
-	host = OverridableDefault()
-	if host != "example.org" {
-		t.Errorf("expected example.org, got %q", host)
-	}
-	host = Default()
-	if host != "github.com" {
-		t.Errorf("expected github.com, got %q", host)
-	}
-}
 
 func TestIsEnterprise(t *testing.T) {
 	tests := []struct {
@@ -38,6 +17,14 @@ func TestIsEnterprise(t *testing.T) {
 		},
 		{
 			host: "api.github.com",
+			want: false,
+		},
+		{
+			host: "github.localhost",
+			want: false,
+		},
+		{
+			host: "api.github.localhost",
 			want: false,
 		},
 		{
@@ -80,6 +67,14 @@ func TestNormalizeHostname(t *testing.T) {
 			want: "github.com",
 		},
 		{
+			host: "GitHub.localhost",
+			want: "github.localhost",
+		},
+		{
+			host: "api.github.localhost",
+			want: "github.localhost",
+		},
+		{
 			host: "GHE.IO",
 			want: "ghe.io",
 		},
@@ -97,6 +92,50 @@ func TestNormalizeHostname(t *testing.T) {
 	}
 }
 
+func TestHostnameValidator(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    interface{}
+		wantsErr bool
+	}{
+		{
+			name:     "valid hostname",
+			input:    "internal.instance",
+			wantsErr: false,
+		},
+		{
+			name:     "hostname with slashes",
+			input:    "//internal.instance",
+			wantsErr: true,
+		},
+		{
+			name:     "empty hostname",
+			input:    "   ",
+			wantsErr: true,
+		},
+		{
+			name:     "hostname with colon",
+			input:    "internal.instance:2205",
+			wantsErr: true,
+		},
+		{
+			name:     "non-string hostname",
+			input:    62,
+			wantsErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := HostnameValidator(tt.input)
+			if tt.wantsErr {
+				assert.Error(t, err)
+				return
+			}
+			assert.NoError(t, err)
+		})
+	}
+}
 func TestGraphQLEndpoint(t *testing.T) {
 	tests := []struct {
 		host string
@@ -105,6 +144,10 @@ func TestGraphQLEndpoint(t *testing.T) {
 		{
 			host: "github.com",
 			want: "https://api.github.com/graphql",
+		},
+		{
+			host: "github.localhost",
+			want: "http://api.github.localhost/graphql",
 		},
 		{
 			host: "ghe.io",
@@ -128,6 +171,10 @@ func TestRESTPrefix(t *testing.T) {
 		{
 			host: "github.com",
 			want: "https://api.github.com/",
+		},
+		{
+			host: "github.localhost",
+			want: "http://api.github.localhost/",
 		},
 		{
 			host: "ghe.io",

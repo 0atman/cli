@@ -11,6 +11,7 @@ import (
 
 	"github.com/AlecAivazis/survey/v2"
 	"github.com/AlecAivazis/survey/v2/terminal"
+	shellquote "github.com/kballard/go-shellquote"
 )
 
 var (
@@ -35,14 +36,8 @@ type GhEditor struct {
 	*survey.Editor
 	EditorCommand string
 	BlankAllowed  bool
-}
 
-func (e *GhEditor) editorCommand() string {
-	if e.EditorCommand == "" {
-		return defaultEditor
-	}
-
-	return e.EditorCommand
+	lookPath func(string) ([]string, []string, error)
 }
 
 // EXTENDED to change prompt text
@@ -77,7 +72,7 @@ func (e *GhEditor) prompt(initialValue string, config *survey.PromptConfig) (int
 		EditorTemplateData{
 			Editor:        *e.Editor,
 			BlankAllowed:  e.BlankAllowed,
-			EditorCommand: filepath.Base(e.editorCommand()),
+			EditorCommand: EditorName(e.EditorCommand),
 			Config:        config,
 		},
 	)
@@ -91,8 +86,10 @@ func (e *GhEditor) prompt(initialValue string, config *survey.PromptConfig) (int
 	defer func() { _ = rr.RestoreTermMode() }()
 
 	cursor := e.NewCursor()
-	cursor.Hide()
-	defer cursor.Show()
+	_ = cursor.Hide()
+	defer func() {
+		_ = cursor.Show()
+	}()
 
 	for {
 		// EXTENDED to handle the e to edit / enter to skip behavior + BlankAllowed
@@ -105,7 +102,7 @@ func (e *GhEditor) prompt(initialValue string, config *survey.PromptConfig) (int
 		}
 		if r == '\r' || r == '\n' {
 			if e.BlankAllowed {
-				return "", nil
+				return initialValue, nil
 			} else {
 				continue
 			}
@@ -123,7 +120,7 @@ func (e *GhEditor) prompt(initialValue string, config *survey.PromptConfig) (int
 					// EXTENDED to support printing editor in prompt, BlankAllowed
 					Editor:        *e.Editor,
 					BlankAllowed:  e.BlankAllowed,
-					EditorCommand: filepath.Base(e.editorCommand()),
+					EditorCommand: EditorName(e.EditorCommand),
 					ShowHelp:      true,
 					Config:        config,
 				},
@@ -136,7 +133,11 @@ func (e *GhEditor) prompt(initialValue string, config *survey.PromptConfig) (int
 	}
 
 	stdio := e.Stdio()
-	text, err := Edit(e.editorCommand(), e.FileName, initialValue, stdio.In, stdio.Out, stdio.Err, cursor)
+	lookPath := e.lookPath
+	if lookPath == nil {
+		lookPath = defaultLookPath
+	}
+	text, err := edit(e.EditorCommand, e.FileName, initialValue, stdio.In, stdio.Out, stdio.Err, cursor, lookPath)
 	if err != nil {
 		return "", err
 	}
@@ -156,4 +157,14 @@ func (e *GhEditor) Prompt(config *survey.PromptConfig) (interface{}, error) {
 		initialValue = e.Default
 	}
 	return e.prompt(initialValue, config)
+}
+
+func EditorName(editorCommand string) string {
+	if editorCommand == "" {
+		editorCommand = defaultEditor
+	}
+	if args, err := shellquote.Split(editorCommand); err == nil {
+		editorCommand = args[0]
+	}
+	return filepath.Base(editorCommand)
 }

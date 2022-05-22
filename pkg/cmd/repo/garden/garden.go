@@ -4,21 +4,22 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"io"
 	"math/rand"
 	"net/http"
+	"os"
 	"os/exec"
 	"runtime"
 	"strconv"
 	"strings"
 
-	"github.com/cli/cli/api"
-	"github.com/cli/cli/internal/ghinstance"
-	"github.com/cli/cli/internal/ghrepo"
-	"github.com/cli/cli/pkg/cmdutil"
-	"github.com/cli/cli/pkg/iostreams"
-	"github.com/cli/cli/utils"
+	"github.com/cli/cli/v2/api"
+	"github.com/cli/cli/v2/internal/config"
+	"github.com/cli/cli/v2/internal/ghrepo"
+	"github.com/cli/cli/v2/pkg/cmdutil"
+	"github.com/cli/cli/v2/pkg/iostreams"
+	"github.com/cli/cli/v2/utils"
 	"github.com/spf13/cobra"
+	"golang.org/x/term"
 )
 
 type Geometry struct {
@@ -49,10 +50,11 @@ type Cell struct {
 }
 
 const (
-	DirUp = iota
+	DirUp Direction = iota
 	DirDown
 	DirLeft
 	DirRight
+	Quit
 )
 
 type Direction = int
@@ -88,6 +90,7 @@ type GardenOptions struct {
 	HttpClient func() (*http.Client, error)
 	IO         *iostreams.IOStreams
 	BaseRepo   func() (ghrepo.Interface, error)
+	Config     func() (config.Config, error)
 
 	RepoArg string
 }
@@ -97,6 +100,7 @@ func NewCmdGarden(f *cmdutil.Factory, runF func(*GardenOptions) error) *cobra.Co
 		IO:         f.IOStreams,
 		HttpClient: f.HttpClient,
 		BaseRepo:   f.BaseRepo,
+		Config:     f.Config,
 	}
 
 	cmd := &cobra.Command{
@@ -119,6 +123,7 @@ func NewCmdGarden(f *cmdutil.Factory, runF func(*GardenOptions) error) *cobra.Co
 }
 
 func gardenRun(opts *GardenOptions) error {
+	cs := opts.IO.ColorScheme()
 	out := opts.IO.Out
 
 	if runtime.GOOS == "windows" {
@@ -146,7 +151,16 @@ func gardenRun(opts *GardenOptions) error {
 		var err error
 		viewURL := opts.RepoArg
 		if !strings.Contains(viewURL, "/") {
-			currentUser, err := api.CurrentLoginName(apiClient, ghinstance.Default())
+			cfg, err := opts.Config()
+			if err != nil {
+				return err
+			}
+			hostname, err := cfg.DefaultHost()
+			if err != nil {
+				return err
+			}
+
+			currentUser, err := api.CurrentLoginName(apiClient, hostname)
 			if err != nil {
 				return err
 			}
@@ -186,52 +200,56 @@ func gardenRun(opts *GardenOptions) error {
 	if err != nil {
 		return err
 	}
-	player := &Player{0, 0, utils.Bold("@"), geo, 0}
+	player := &Player{0, 0, cs.Bold("@"), geo, 0}
 
 	garden := plantGarden(commits, geo)
+	if len(garden) < geo.Height {
+		geo.Height = len(garden)
+	}
+	if geo.Height > 0 && len(garden[0]) < geo.Width {
+		geo.Width = len(garden[0])
+	} else if len(garden) == 0 {
+		geo.Width = 0
+	}
 	clear(opts.IO)
-	drawGarden(out, garden, player)
+	drawGarden(opts.IO, garden, player)
 
-	// thanks stackoverflow https://stackoverflow.com/a/17278776
-	if runtime.GOOS == "darwin" {
-		_ = exec.Command("stty", "-f", "/dev/tty", "cbreak", "min", "1").Run()
-		_ = exec.Command("stty", "-f", "/dev/tty", "-echo").Run()
-	} else {
-		_ = exec.Command("stty", "-F", "/dev/tty", "cbreak", "min", "1").Run()
-		_ = exec.Command("stty", "-F", "/dev/tty", "-echo").Run()
+	// TODO: use opts.IO instead of os.Stdout
+	oldTermState, err := term.MakeRaw(int(os.Stdout.Fd()))
+	if err != nil {
+		return fmt.Errorf("term.MakeRaw: %w", err)
 	}
 
-	var b []byte = make([]byte, 3)
-	for {
-		_, _ = opts.IO.In.Read(b)
+	dirc := make(chan Direction)
+	go func() {
+		b := make([]byte, 3)
+		for {
+			_, _ = opts.IO.In.Read(b)
+			switch {
+			case isLeft(b):
+				dirc <- DirLeft
+			case isRight(b):
+				dirc <- DirRight
+			case isUp(b):
+				dirc <- DirUp
+			case isDown(b):
+				dirc <- DirDown
+			case isQuit(b):
+				dirc <- Quit
+			}
+		}
+	}()
 
+mainLoop:
+	for {
 		oldX := player.X
 		oldY := player.Y
-		moved := false
-		quitting := false
-		continuing := false
 
-		switch {
-		case isLeft(b):
-			moved = player.move(DirLeft)
-		case isRight(b):
-			moved = player.move(DirRight)
-		case isUp(b):
-			moved = player.move(DirUp)
-		case isDown(b):
-			moved = player.move(DirDown)
-		case isQuit(b):
-			quitting = true
-		default:
-			continuing = true
-		}
-
-		if quitting {
-			break
-		}
-
-		if !moved || continuing {
-			continue
+		d := <-dirc
+		if d == Quit {
+			break mainLoop
+		} else if !player.move(d) {
+			continue mainLoop
 		}
 
 		underPlayer := garden[player.Y][player.X]
@@ -269,7 +287,7 @@ func gardenRun(opts *GardenOptions) error {
 		}
 
 		// status line stuff
-		sl := statusLine(garden, player)
+		sl := statusLine(garden, player, opts.IO)
 
 		fmt.Fprint(out, "\033[;H") // move to top left
 		for y := 0; y < player.Geo.Height-1; y++ {
@@ -278,13 +296,14 @@ func gardenRun(opts *GardenOptions) error {
 		fmt.Fprintln(out)
 		fmt.Fprintln(out)
 
-		fmt.Fprint(out, utils.Bold(sl))
+		fmt.Fprint(out, cs.Bold(sl))
 	}
 
 	clear(opts.IO)
 	fmt.Fprint(out, "\033[?25h")
-	fmt.Fprintln(out)
-	fmt.Fprintln(out, utils.Bold("You turn and walk away from the wildflower garden..."))
+	// TODO: use opts.IO instead of os.Stdout
+	_ = term.Restore(int(os.Stdout.Fd()), oldTermState)
+	fmt.Fprintln(out, cs.Bold("You turn and walk away from the wildflower garden..."))
 
 	return nil
 }
@@ -313,8 +332,10 @@ func isUp(b []byte) bool {
 	return bytes.EqualFold(b, up) || r == 'w' || r == 'k'
 }
 
+var ctrlC = []byte{0x3, 0x5b, 0x43}
+
 func isQuit(b []byte) bool {
-	return rune(b[0]) == 'q'
+	return rune(b[0]) == 'q' || bytes.Equal(b, ctrlC)
 }
 
 func plantGarden(commits []*Commit, geo *Geometry) [][]*Cell {
@@ -393,7 +414,10 @@ func plantGarden(commits []*Commit, geo *Geometry) [][]*Cell {
 	return garden
 }
 
-func drawGarden(out io.Writer, garden [][]*Cell, player *Player) {
+func drawGarden(io *iostreams.IOStreams, garden [][]*Cell, player *Player) {
+	out := io.Out
+	cs := io.ColorScheme()
+
 	fmt.Fprint(out, "\033[?25l") // hide cursor. it needs to be restored at command exit.
 	sl := ""
 	for y, gardenRow := range garden {
@@ -402,7 +426,7 @@ func drawGarden(out io.Writer, garden [][]*Cell, player *Player) {
 			underPlayer := (player.X == x && player.Y == y)
 			if underPlayer {
 				sl = gardenCell.StatusLine
-				char = utils.Bold(player.Char)
+				char = cs.Bold(player.Char)
 
 				if strings.Contains(gardenCell.StatusLine, "stream") {
 					player.ShoeMoistureContent = 5
@@ -417,20 +441,29 @@ func drawGarden(out io.Writer, garden [][]*Cell, player *Player) {
 	}
 
 	fmt.Println()
-	fmt.Fprintln(out, utils.Bold(sl))
+	fmt.Fprintln(out, cs.Bold(sl))
 }
 
-func statusLine(garden [][]*Cell, player *Player) string {
-	statusLine := garden[player.Y][player.X].StatusLine + "         "
+func statusLine(garden [][]*Cell, player *Player, io *iostreams.IOStreams) string {
+	width := io.TerminalWidth()
+	statusLines := []string{garden[player.Y][player.X].StatusLine}
+
 	if player.ShoeMoistureContent > 1 {
-		statusLine += "\nYour shoes squish with water from the stream."
+		statusLines = append(statusLines, "Your shoes squish with water from the stream.")
 	} else if player.ShoeMoistureContent == 1 {
-		statusLine += "\nYour shoes seem to have dried out."
+		statusLines = append(statusLines, "Your shoes seem to have dried out.")
 	} else {
-		statusLine += "\n                                             "
+		statusLines = append(statusLines, "")
 	}
 
-	return statusLine
+	for i, line := range statusLines {
+		if len(line) < width {
+			paddingSize := width - len(line)
+			statusLines[i] = line + strings.Repeat(" ", paddingSize)
+		}
+	}
+
+	return strings.Join(statusLines, "\n")
 }
 
 func shaToColorFunc(sha string) func(string) string {

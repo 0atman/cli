@@ -6,15 +6,18 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cli/cli/internal/ghinstance"
-	"github.com/cli/cli/pkg/cmdutil"
-	"github.com/cli/cli/pkg/iostreams"
-	"github.com/cli/cli/utils"
+	"github.com/cli/cli/v2/internal/config"
+	"github.com/cli/cli/v2/pkg/cmd/gist/shared"
+	"github.com/cli/cli/v2/pkg/cmdutil"
+	"github.com/cli/cli/v2/pkg/iostreams"
+	"github.com/cli/cli/v2/pkg/text"
+	"github.com/cli/cli/v2/utils"
 	"github.com/spf13/cobra"
 )
 
 type ListOptions struct {
 	IO         *iostreams.IOStreams
+	Config     func() (config.Config, error)
 	HttpClient func() (*http.Client, error)
 
 	Limit      int
@@ -24,39 +27,40 @@ type ListOptions struct {
 func NewCmdList(f *cmdutil.Factory, runF func(*ListOptions) error) *cobra.Command {
 	opts := &ListOptions{
 		IO:         f.IOStreams,
+		Config:     f.Config,
 		HttpClient: f.HttpClient,
 	}
 
+	var flagPublic bool
+	var flagSecret bool
+
 	cmd := &cobra.Command{
-		Use:   "list",
-		Short: "List your gists",
-		Args:  cobra.NoArgs,
+		Use:     "list",
+		Short:   "List your gists",
+		Aliases: []string{"ls"},
+		Args:    cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if opts.Limit < 1 {
-				return &cmdutil.FlagError{Err: fmt.Errorf("invalid limit: %v", opts.Limit)}
+				return cmdutil.FlagErrorf("invalid limit: %v", opts.Limit)
 			}
 
-			pub := cmd.Flags().Changed("public")
-			secret := cmd.Flags().Changed("secret")
-
 			opts.Visibility = "all"
-			if pub && !secret {
-				opts.Visibility = "public"
-			} else if secret && !pub {
+			if flagSecret {
 				opts.Visibility = "secret"
+			} else if flagPublic {
+				opts.Visibility = "public"
 			}
 
 			if runF != nil {
 				return runF(opts)
 			}
-
 			return listRun(opts)
 		},
 	}
 
 	cmd.Flags().IntVarP(&opts.Limit, "limit", "L", 10, "Maximum number of gists to fetch")
-	cmd.Flags().Bool("public", false, "Show only public gists")
-	cmd.Flags().Bool("secret", false, "Show only secret gists")
+	cmd.Flags().BoolVar(&flagPublic, "public", false, "Show only public gists")
+	cmd.Flags().BoolVar(&flagSecret, "secret", false, "Show only secret gists")
 
 	return cmd
 }
@@ -67,9 +71,29 @@ func listRun(opts *ListOptions) error {
 		return err
 	}
 
-	gists, err := listGists(client, ghinstance.OverridableDefault(), opts.Limit, opts.Visibility)
+	cfg, err := opts.Config()
 	if err != nil {
 		return err
+	}
+
+	host, err := cfg.DefaultHost()
+	if err != nil {
+		return err
+	}
+
+	gists, err := shared.ListGists(client, host, opts.Limit, opts.Visibility)
+	if err != nil {
+		return err
+	}
+
+	if len(gists) == 0 {
+		return cmdutil.NewNoResultsError("no gists found")
+	}
+
+	if err := opts.IO.StartPager(); err == nil {
+		defer opts.IO.StopPager()
+	} else {
+		fmt.Fprintf(opts.IO.ErrOut, "failed to start pager: %v\n", err)
 	}
 
 	cs := opts.IO.ColorScheme()
@@ -77,10 +101,7 @@ func listRun(opts *ListOptions) error {
 	tp := utils.NewTablePrinter(opts.IO)
 
 	for _, gist := range gists {
-		fileCount := 0
-		for range gist.Files {
-			fileCount++
-		}
+		fileCount := len(gist.Files)
 
 		visibility := "public"
 		visColor := cs.Green
@@ -99,16 +120,16 @@ func listRun(opts *ListOptions) error {
 			}
 		}
 
+		gistTime := gist.UpdatedAt.Format(time.RFC3339)
+		if tp.IsTTY() {
+			gistTime = utils.FuzzyAgo(time.Since(gist.UpdatedAt))
+		}
+
 		tp.AddField(gist.ID, nil, nil)
-		tp.AddField(description, nil, cs.Bold)
+		tp.AddField(text.ReplaceExcessiveWhitespace(description), nil, cs.Bold)
 		tp.AddField(utils.Pluralize(fileCount, "file"), nil, nil)
 		tp.AddField(visibility, nil, visColor)
-		if tp.IsTTY() {
-			updatedAt := utils.FuzzyAgo(time.Since(gist.UpdatedAt))
-			tp.AddField(updatedAt, nil, cs.Gray)
-		} else {
-			tp.AddField(gist.UpdatedAt.String(), nil, nil)
-		}
+		tp.AddField(gistTime, nil, cs.Gray)
 		tp.EndRow()
 	}
 

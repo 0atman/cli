@@ -3,11 +3,10 @@ package git
 import (
 	"fmt"
 	"net/url"
-	"os/exec"
 	"regexp"
 	"strings"
 
-	"github.com/cli/cli/internal/run"
+	"github.com/cli/cli/v2/internal/run"
 )
 
 var remoteRE = regexp.MustCompile(`(.+)\s+(.+)\s+\((push|fetch)\)`)
@@ -36,16 +35,14 @@ func (r *Remote) String() string {
 	return r.Name
 }
 
-// Remotes gets the git remotes set for the current repo
-func Remotes() (RemoteSet, error) {
-	list, err := listRemotes()
+func remotes(path string, remoteList []string) (RemoteSet, error) {
+	remotes := parseRemotes(remoteList)
+
+	// this is affected by SetRemoteResolution
+	remoteCmd, err := GitCommand("-C", path, "config", "--get-regexp", `^remote\..*\.gh-resolved$`)
 	if err != nil {
 		return nil, err
 	}
-	remotes := parseRemotes(list)
-
-	// this is affected by SetRemoteResolution
-	remoteCmd := exec.Command("git", "config", "--get-regexp", `^remote\..*\.gh-resolved$`)
 	output, _ := run.PrepareCmd(remoteCmd).Output()
 	for _, l := range outputLines(output) {
 		parts := strings.SplitN(l, " ", 2)
@@ -66,6 +63,23 @@ func Remotes() (RemoteSet, error) {
 	}
 
 	return remotes, nil
+}
+
+func RemotesForPath(path string) (RemoteSet, error) {
+	list, err := listRemotesForPath(path)
+	if err != nil {
+		return nil, err
+	}
+	return remotes(path, list)
+}
+
+// Remotes gets the git remotes set for the current repo
+func Remotes() (RemoteSet, error) {
+	list, err := listRemotes()
+	if err != nil {
+		return nil, err
+	}
+	return remotes(".", list)
 }
 
 func parseRemotes(gitRemotes []string) (remotes RemoteSet) {
@@ -107,8 +121,11 @@ func parseRemotes(gitRemotes []string) (remotes RemoteSet) {
 
 // AddRemote adds a new git remote and auto-fetches objects from it
 func AddRemote(name, u string) (*Remote, error) {
-	addCmd := exec.Command("git", "remote", "add", "-f", name, u)
-	err := run.PrepareCmd(addCmd).Run()
+	addCmd, err := GitCommand("remote", "add", "-f", name, u)
+	if err != nil {
+		return nil, err
+	}
+	err = run.PrepareCmd(addCmd).Run()
 	if err != nil {
 		return nil, err
 	}
@@ -135,7 +152,18 @@ func AddRemote(name, u string) (*Remote, error) {
 	}, nil
 }
 
+func UpdateRemoteURL(name, u string) error {
+	addCmd, err := GitCommand("remote", "set-url", name, u)
+	if err != nil {
+		return err
+	}
+	return run.PrepareCmd(addCmd).Run()
+}
+
 func SetRemoteResolution(name, resolution string) error {
-	addCmd := exec.Command("git", "config", "--add", fmt.Sprintf("remote.%s.gh-resolved", name), resolution)
+	addCmd, err := GitCommand("config", "--add", fmt.Sprintf("remote.%s.gh-resolved", name), resolution)
+	if err != nil {
+		return err
+	}
 	return run.PrepareCmd(addCmd).Run()
 }

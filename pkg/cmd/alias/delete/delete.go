@@ -3,10 +3,9 @@ package delete
 import (
 	"fmt"
 
-	"github.com/cli/cli/internal/config"
-	"github.com/cli/cli/pkg/cmdutil"
-	"github.com/cli/cli/pkg/iostreams"
-	"github.com/cli/cli/utils"
+	"github.com/cli/cli/v2/internal/config"
+	"github.com/cli/cli/v2/pkg/cmdutil"
+	"github.com/cli/cli/v2/pkg/iostreams"
 	"github.com/spf13/cobra"
 )
 
@@ -63,8 +62,8 @@ func deleteRun(opts *DeleteOptions) error {
 	}
 
 	if opts.IO.IsStdoutTTY() {
-		redCheck := utils.Red("✓")
-		fmt.Fprintf(opts.IO.ErrOut, "%s Deleted alias %s; was %s\n", redCheck, opts.Name, expansion)
+		cs := opts.IO.ColorScheme()
+		fmt.Fprintf(opts.IO.ErrOut, "%s Deleted alias %s; was %s\n", cs.SuccessIconWithColor(cs.Red), opts.Name, expansion)
 	}
 
 	return nil

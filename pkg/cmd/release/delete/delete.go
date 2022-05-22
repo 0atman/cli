@@ -5,12 +5,12 @@ import (
 	"net/http"
 
 	"github.com/AlecAivazis/survey/v2"
-	"github.com/cli/cli/api"
-	"github.com/cli/cli/internal/ghrepo"
-	"github.com/cli/cli/pkg/cmd/release/shared"
-	"github.com/cli/cli/pkg/cmdutil"
-	"github.com/cli/cli/pkg/iostreams"
-	"github.com/cli/cli/pkg/prompt"
+	"github.com/cli/cli/v2/api"
+	"github.com/cli/cli/v2/internal/ghrepo"
+	"github.com/cli/cli/v2/pkg/cmd/release/shared"
+	"github.com/cli/cli/v2/pkg/cmdutil"
+	"github.com/cli/cli/v2/pkg/iostreams"
+	"github.com/cli/cli/v2/pkg/prompt"
 	"github.com/spf13/cobra"
 )
 
@@ -78,7 +78,7 @@ func deleteRun(opts *DeleteOptions) error {
 		}
 
 		if !confirmed {
-			return cmdutil.SilentError
+			return cmdutil.CancelError
 		}
 	}
 
@@ -92,7 +92,7 @@ func deleteRun(opts *DeleteOptions) error {
 	}
 
 	iofmt := opts.IO.ColorScheme()
-	fmt.Fprintf(opts.IO.ErrOut, "%s Deleted release %s\n", iofmt.SuccessIcon(), release.TagName)
+	fmt.Fprintf(opts.IO.ErrOut, "%s Deleted release %s\n", iofmt.SuccessIconWithColor(iofmt.Red), release.TagName)
 	if !release.IsDraft {
 		fmt.Fprintf(opts.IO.ErrOut, "%s Note that the %s git tag still remains in the repository\n", iofmt.WarningIcon(), release.TagName)
 	}

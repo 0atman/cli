@@ -3,45 +3,49 @@ package create
 import (
 	"bytes"
 	"encoding/json"
-	"io/ioutil"
+	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
-	"github.com/cli/cli/pkg/cmdutil"
-	"github.com/cli/cli/pkg/httpmock"
-	"github.com/cli/cli/pkg/iostreams"
+	"github.com/MakeNowJust/heredoc"
+	"github.com/cli/cli/v2/internal/config"
+	"github.com/cli/cli/v2/internal/run"
+	"github.com/cli/cli/v2/pkg/cmd/gist/shared"
+	"github.com/cli/cli/v2/pkg/cmdutil"
+	"github.com/cli/cli/v2/pkg/httpmock"
+	"github.com/cli/cli/v2/pkg/iostreams"
 	"github.com/google/shlex"
 	"github.com/stretchr/testify/assert"
 )
 
-const (
-	fixtureFile = "../fixture.txt"
-)
-
 func Test_processFiles(t *testing.T) {
 	fakeStdin := strings.NewReader("hey cool how is it going")
-	files, err := processFiles(ioutil.NopCloser(fakeStdin), "", []string{"-"})
+	files, err := processFiles(io.NopCloser(fakeStdin), "", []string{"-"})
 	if err != nil {
 		t.Fatalf("unexpected error processing files: %s", err)
 	}
 
 	assert.Equal(t, 1, len(files))
-	assert.Equal(t, "hey cool how is it going", files["gistfile0.txt"])
+	assert.Equal(t, "hey cool how is it going", files["gistfile0.txt"].Content)
 }
 
 func Test_guessGistName_stdin(t *testing.T) {
-	files := map[string]string{"gistfile0.txt": "sample content"}
+	files := map[string]*shared.GistFile{
+		"gistfile0.txt": {Content: "sample content"},
+	}
 
 	gistName := guessGistName(files)
 	assert.Equal(t, "", gistName)
 }
 
 func Test_guessGistName_userFiles(t *testing.T) {
-	files := map[string]string{
-		"fig.txt":       "I am a fig.",
-		"apple.txt":     "I am an apple.",
-		"gistfile0.txt": "sample content",
+	files := map[string]*shared.GistFile{
+		"fig.txt":       {Content: "I am a fig"},
+		"apple.txt":     {Content: "I am an apple"},
+		"gistfile0.txt": {Content: "sample content"},
 	}
 
 	gistName := guessGistName(files)
@@ -123,9 +127,9 @@ func TestNewCmdCreate(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			io, _, _, _ := iostreams.Test()
+			ios, _, _, _ := iostreams.Test()
 			f := &cmdutil.Factory{
-				IOStreams: io,
+				IOStreams: ios,
 			}
 
 			if tt.factory != nil {
@@ -159,14 +163,22 @@ func TestNewCmdCreate(t *testing.T) {
 }
 
 func Test_createRun(t *testing.T) {
+	tempDir := t.TempDir()
+	fixtureFile := filepath.Join(tempDir, "fixture.txt")
+	assert.NoError(t, os.WriteFile(fixtureFile, []byte("{}"), 0644))
+	emptyFile := filepath.Join(tempDir, "empty.txt")
+	assert.NoError(t, os.WriteFile(emptyFile, []byte(" \t\n"), 0644))
+
 	tests := []struct {
-		name       string
-		opts       *CreateOptions
-		stdin      string
-		wantOut    string
-		wantStderr string
-		wantParams map[string]interface{}
-		wantErr    bool
+		name           string
+		opts           *CreateOptions
+		stdin          string
+		wantOut        string
+		wantStderr     string
+		wantParams     map[string]interface{}
+		wantErr        bool
+		wantBrowse     string
+		responseStatus int
 	}{
 		{
 			name: "public",
@@ -178,13 +190,16 @@ func Test_createRun(t *testing.T) {
 			wantStderr: "- Creating gist fixture.txt\n✓ Created gist fixture.txt\n",
 			wantErr:    false,
 			wantParams: map[string]interface{}{
-				"public": true,
+				"description": "",
+				"updated_at":  "0001-01-01T00:00:00Z",
+				"public":      true,
 				"files": map[string]interface{}{
 					"fixture.txt": map[string]interface{}{
 						"content": "{}",
 					},
 				},
 			},
+			responseStatus: http.StatusOK,
 		},
 		{
 			name: "with description",
@@ -197,12 +212,15 @@ func Test_createRun(t *testing.T) {
 			wantErr:    false,
 			wantParams: map[string]interface{}{
 				"description": "an incredibly interesting gist",
+				"updated_at":  "0001-01-01T00:00:00Z",
+				"public":      false,
 				"files": map[string]interface{}{
 					"fixture.txt": map[string]interface{}{
 						"content": "{}",
 					},
 				},
 			},
+			responseStatus: http.StatusOK,
 		},
 		{
 			name: "multiple files",
@@ -214,6 +232,9 @@ func Test_createRun(t *testing.T) {
 			wantStderr: "- Creating gist with multiple files\n✓ Created gist fixture.txt\n",
 			wantErr:    false,
 			wantParams: map[string]interface{}{
+				"description": "",
+				"updated_at":  "0001-01-01T00:00:00Z",
+				"public":      false,
 				"files": map[string]interface{}{
 					"fixture.txt": map[string]interface{}{
 						"content": "{}",
@@ -223,6 +244,28 @@ func Test_createRun(t *testing.T) {
 					},
 				},
 			},
+			responseStatus: http.StatusOK,
+		},
+		{
+			name: "file with empty content",
+			opts: &CreateOptions{
+				Filenames: []string{emptyFile},
+			},
+			wantOut: "",
+			wantStderr: heredoc.Doc(`
+				- Creating gist empty.txt
+				X Failed to create gist: a gist file cannot be blank
+			`),
+			wantErr: true,
+			wantParams: map[string]interface{}{
+				"description": "",
+				"updated_at":  "0001-01-01T00:00:00Z",
+				"public":      false,
+				"files": map[string]interface{}{
+					"empty.txt": map[string]interface{}{"content": " \t\n"},
+				},
+			},
+			responseStatus: http.StatusUnprocessableEntity,
 		},
 		{
 			name: "stdin arg",
@@ -234,28 +277,71 @@ func Test_createRun(t *testing.T) {
 			wantStderr: "- Creating gist...\n✓ Created gist\n",
 			wantErr:    false,
 			wantParams: map[string]interface{}{
+				"description": "",
+				"updated_at":  "0001-01-01T00:00:00Z",
+				"public":      false,
 				"files": map[string]interface{}{
 					"gistfile0.txt": map[string]interface{}{
 						"content": "cool stdin content",
 					},
 				},
 			},
+			responseStatus: http.StatusOK,
+		},
+		{
+			name: "web arg",
+			opts: &CreateOptions{
+				WebMode:   true,
+				Filenames: []string{fixtureFile},
+			},
+			wantOut:    "Opening gist.github.com/aa5a315d61ae9438b18d in your browser.\n",
+			wantStderr: "- Creating gist fixture.txt\n✓ Created gist fixture.txt\n",
+			wantErr:    false,
+			wantBrowse: "https://gist.github.com/aa5a315d61ae9438b18d",
+			wantParams: map[string]interface{}{
+				"description": "",
+				"updated_at":  "0001-01-01T00:00:00Z",
+				"public":      false,
+				"files": map[string]interface{}{
+					"fixture.txt": map[string]interface{}{
+						"content": "{}",
+					},
+				},
+			},
+			responseStatus: http.StatusOK,
 		},
 	}
 	for _, tt := range tests {
 		reg := &httpmock.Registry{}
-		reg.Register(httpmock.REST("POST", "gists"),
-			httpmock.JSONResponse(struct {
-				Html_url string
-			}{"https://gist.github.com/aa5a315d61ae9438b18d"}))
+		if tt.responseStatus == http.StatusOK {
+			reg.Register(
+				httpmock.REST("POST", "gists"),
+				httpmock.StringResponse(`{
+					"html_url": "https://gist.github.com/aa5a315d61ae9438b18d"
+				}`))
+		} else {
+			reg.Register(
+				httpmock.REST("POST", "gists"),
+				httpmock.StatusStringResponse(tt.responseStatus, "{}"))
+		}
 
 		mockClient := func() (*http.Client, error) {
 			return &http.Client{Transport: reg}, nil
 		}
 		tt.opts.HttpClient = mockClient
 
-		io, stdin, stdout, stderr := iostreams.Test()
-		tt.opts.IO = io
+		tt.opts.Config = func() (config.Config, error) {
+			return config.NewBlankConfig(), nil
+		}
+
+		ios, stdin, stdout, stderr := iostreams.Test()
+		tt.opts.IO = ios
+
+		browser := &cmdutil.TestBrowser{}
+		tt.opts.Browser = browser
+
+		_, teardown := run.Stub()
+		defer teardown(t)
 
 		t.Run(tt.name, func(t *testing.T) {
 			stdin.WriteString(tt.stdin)
@@ -263,7 +349,7 @@ func Test_createRun(t *testing.T) {
 			if err := createRun(tt.opts); (err != nil) != tt.wantErr {
 				t.Errorf("createRun() error = %v, wantErr %v", err, tt.wantErr)
 			}
-			bodyBytes, _ := ioutil.ReadAll(reg.Requests[0].Body)
+			bodyBytes, _ := io.ReadAll(reg.Requests[0].Body)
 			reqBody := make(map[string]interface{})
 			err := json.Unmarshal(bodyBytes, &reqBody)
 			if err != nil {
@@ -273,41 +359,33 @@ func Test_createRun(t *testing.T) {
 			assert.Equal(t, tt.wantStderr, stderr.String())
 			assert.Equal(t, tt.wantParams, reqBody)
 			reg.Verify(t)
+			browser.Verify(t, tt.wantBrowse)
 		})
 	}
 }
 
-func Test_CreateRun_reauth(t *testing.T) {
-	reg := &httpmock.Registry{}
-	reg.Register(httpmock.REST("POST", "gists"), func(req *http.Request) (*http.Response, error) {
-		return &http.Response{
-			StatusCode: 404,
-			Request:    req,
-			Header: map[string][]string{
-				"X-Oauth-Scopes": {"coolScope"},
-			},
-			Body: ioutil.NopCloser(bytes.NewBufferString("oh no")),
-		}, nil
-	})
-
-	mockClient := func() (*http.Client, error) {
-		return &http.Client{Transport: reg}, nil
+func Test_detectEmptyFiles(t *testing.T) {
+	tests := []struct {
+		content     string
+		isEmptyFile bool
+	}{
+		{
+			content:     "{}",
+			isEmptyFile: false,
+		},
+		{
+			content:     "\n\t",
+			isEmptyFile: true,
+		},
 	}
 
-	io, _, _, _ := iostreams.Test()
+	for _, tt := range tests {
+		files := map[string]*shared.GistFile{}
+		files["file"] = &shared.GistFile{
+			Content: tt.content,
+		}
 
-	opts := &CreateOptions{
-		IO:         io,
-		HttpClient: mockClient,
-		Filenames:  []string{fixtureFile},
-	}
-
-	err := createRun(opts)
-	if err == nil {
-		t.Fatalf("expected oauth error")
-	}
-
-	if !strings.Contains(err.Error(), "Please re-authenticate") {
-		t.Errorf("got unexpected error: %s", err)
+		isEmptyFile := detectEmptyFiles(files)
+		assert.Equal(t, tt.isEmptyFile, isEmptyFile)
 	}
 }

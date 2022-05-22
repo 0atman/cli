@@ -3,11 +3,13 @@ package root
 import (
 	"bytes"
 	"fmt"
+	"sort"
 	"strings"
 
-	"github.com/cli/cli/pkg/text"
-	"github.com/cli/cli/utils"
+	"github.com/cli/cli/v2/pkg/cmdutil"
+	"github.com/cli/cli/v2/pkg/text"
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 )
 
 func rootUsageFunc(command *cobra.Command) error {
@@ -31,6 +33,13 @@ func rootUsageFunc(command *cobra.Command) error {
 		command.Print(text.Indent(dedent(flagUsages), "  "))
 	}
 	return nil
+}
+
+func rootFlagErrorFunc(cmd *cobra.Command, err error) error {
+	if err == pflag.ErrHelp {
+		return err
+	}
+	return cmdutil.FlagErrorWrap(err)
 }
 
 var hasFailed bool
@@ -71,14 +80,18 @@ func isRootCmd(command *cobra.Command) bool {
 	return command != nil && !command.HasParent()
 }
 
-func rootHelpFunc(command *cobra.Command, args []string) {
+func rootHelpFunc(f *cmdutil.Factory, command *cobra.Command, args []string) {
+	cs := f.IOStreams.ColorScheme()
+
 	if isRootCmd(command.Parent()) && len(args) >= 2 && args[1] != "--help" && args[1] != "-h" {
 		nestedSuggestFunc(command, args[1])
 		hasFailed = true
 		return
 	}
 
+	namePadding := 12
 	coreCommands := []string{}
+	actionsCommands := []string{}
 	additionalCommands := []string{}
 	for _, c := range command.Commands() {
 		if c.Short == "" {
@@ -88,9 +101,11 @@ func rootHelpFunc(command *cobra.Command, args []string) {
 			continue
 		}
 
-		s := rpad(c.Name()+":", c.NamePadding()) + c.Short
+		s := rpad(c.Name()+":", namePadding) + c.Short
 		if _, ok := c.Annotations["IsCore"]; ok {
 			coreCommands = append(coreCommands, s)
+		} else if _, ok := c.Annotations["IsActions"]; ok {
+			actionsCommands = append(actionsCommands, s)
 		} else {
 			additionalCommands = append(additionalCommands, s)
 		}
@@ -107,18 +122,48 @@ func rootHelpFunc(command *cobra.Command, args []string) {
 		Body  string
 	}
 
+	longText := command.Long
+	if longText == "" {
+		longText = command.Short
+	}
+	if longText != "" && command.LocalFlags().Lookup("jq") != nil {
+		longText = strings.TrimRight(longText, "\n") +
+			"\n\nFor more information about output formatting flags, see `gh help formatting`."
+	}
+
 	helpEntries := []helpEntry{}
-	if command.Long != "" {
-		helpEntries = append(helpEntries, helpEntry{"", command.Long})
-	} else if command.Short != "" {
-		helpEntries = append(helpEntries, helpEntry{"", command.Short})
+	if longText != "" {
+		helpEntries = append(helpEntries, helpEntry{"", longText})
 	}
 	helpEntries = append(helpEntries, helpEntry{"USAGE", command.UseLine()})
 	if len(coreCommands) > 0 {
 		helpEntries = append(helpEntries, helpEntry{"CORE COMMANDS", strings.Join(coreCommands, "\n")})
 	}
+	if len(actionsCommands) > 0 {
+		helpEntries = append(helpEntries, helpEntry{"ACTIONS COMMANDS", strings.Join(actionsCommands, "\n")})
+	}
 	if len(additionalCommands) > 0 {
 		helpEntries = append(helpEntries, helpEntry{"ADDITIONAL COMMANDS", strings.Join(additionalCommands, "\n")})
+	}
+
+	if isRootCmd(command) {
+		var helpTopics []string
+		if c := findCommand(command, "actions"); c != nil {
+			helpTopics = append(helpTopics, rpad(c.Name()+":", namePadding)+c.Short)
+		}
+		for topic, params := range HelpTopics {
+			helpTopics = append(helpTopics, rpad(topic+":", namePadding)+params["short"])
+		}
+		sort.Strings(helpTopics)
+		helpEntries = append(helpEntries, helpEntry{"HELP TOPICS", strings.Join(helpTopics, "\n")})
+
+		if exts := f.ExtensionManager.List(); len(exts) > 0 {
+			var names []string
+			for _, ext := range exts {
+				names = append(names, ext.Name())
+			}
+			helpEntries = append(helpEntries, helpEntry{"EXTENSION COMMANDS", strings.Join(names, "\n")})
+		}
 	}
 
 	flagUsages := command.LocalFlags().FlagUsages()
@@ -149,7 +194,7 @@ Read the manual at https://cli.github.com/manual`})
 	for _, e := range helpEntries {
 		if e.Title != "" {
 			// If there is a title, add indentation to each line in the body
-			fmt.Fprintln(out, utils.Bold(e.Title))
+			fmt.Fprintln(out, cs.Bold(e.Title))
 			fmt.Fprintln(out, text.Indent(strings.Trim(e.Body, "\r\n"), "  "))
 		} else {
 			// If there is no title print the body as is
@@ -157,6 +202,15 @@ Read the manual at https://cli.github.com/manual`})
 		}
 		fmt.Fprintln(out)
 	}
+}
+
+func findCommand(cmd *cobra.Command, name string) *cobra.Command {
+	for _, c := range cmd.Commands() {
+		if c.Name() == name {
+			return c
+		}
+	}
+	return nil
 }
 
 // rpad adds padding to the right of a string.

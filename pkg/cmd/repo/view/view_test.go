@@ -7,11 +7,13 @@ import (
 	"testing"
 
 	"github.com/MakeNowJust/heredoc"
-	"github.com/cli/cli/internal/ghrepo"
-	"github.com/cli/cli/pkg/cmdutil"
-	"github.com/cli/cli/pkg/httpmock"
-	"github.com/cli/cli/pkg/iostreams"
-	"github.com/cli/cli/test"
+	"github.com/cli/cli/v2/api"
+	"github.com/cli/cli/v2/internal/config"
+	"github.com/cli/cli/v2/internal/ghrepo"
+	"github.com/cli/cli/v2/internal/run"
+	"github.com/cli/cli/v2/pkg/cmdutil"
+	"github.com/cli/cli/v2/pkg/httpmock"
+	"github.com/cli/cli/v2/pkg/iostreams"
 	"github.com/google/shlex"
 	"github.com/stretchr/testify/assert"
 )
@@ -99,15 +101,19 @@ func Test_RepoView_Web(t *testing.T) {
 		name       string
 		stdoutTTY  bool
 		wantStderr string
+		wantBrowse string
 	}{
 		{
 			name:       "tty",
 			stdoutTTY:  true,
 			wantStderr: "Opening github.com/OWNER/REPO in your browser.\n",
+			wantBrowse: "https://github.com/OWNER/REPO",
 		},
 		{
 			name:       "nontty",
+			stdoutTTY:  false,
 			wantStderr: "",
+			wantBrowse: "https://github.com/OWNER/REPO",
 		},
 	}
 
@@ -115,6 +121,7 @@ func Test_RepoView_Web(t *testing.T) {
 		reg := &httpmock.Registry{}
 		reg.StubRepoInfoResponse("OWNER", "REPO", "main")
 
+		browser := &cmdutil.TestBrowser{}
 		opts := &ViewOptions{
 			Web: true,
 			HttpClient: func() (*http.Client, error) {
@@ -123,6 +130,7 @@ func Test_RepoView_Web(t *testing.T) {
 			BaseRepo: func() (ghrepo.Interface, error) {
 				return ghrepo.New("OWNER", "REPO"), nil
 			},
+			Browser: browser,
 		}
 
 		io, _, stdout, stderr := iostreams.Test()
@@ -132,20 +140,16 @@ func Test_RepoView_Web(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			io.SetStdoutTTY(tt.stdoutTTY)
 
-			cs, teardown := test.InitCmdStubber()
-			defer teardown()
-
-			cs.Stub("") // browser open
+			_, teardown := run.Stub()
+			defer teardown(t)
 
 			if err := viewRun(opts); err != nil {
 				t.Errorf("viewRun() error = %v", err)
 			}
 			assert.Equal(t, "", stdout.String())
-			assert.Equal(t, 1, len(cs.Calls))
-			call := cs.Calls[0]
-			assert.Equal(t, "https://github.com/OWNER/REPO", call.Args[len(call.Args)-1])
 			assert.Equal(t, tt.wantStderr, stderr.String())
 			reg.Verify(t)
+			browser.Verify(t, tt.wantBrowse)
 		})
 	}
 }
@@ -222,7 +226,7 @@ func Test_ViewRun(t *testing.T) {
 
 
 
-				View this repository on GitHub: https://github.com/OWNER/REPO
+				View this repository on GitHub: https://github.com/OWNER/REPO/tree/feat%2Fawesome
 			`),
 		},
 		{
@@ -525,6 +529,9 @@ func Test_ViewRun_WithoutUsername(t *testing.T) {
 			return &http.Client{Transport: reg}, nil
 		},
 		IO: io,
+		Config: func() (config.Config, error) {
+			return config.NewBlankConfig(), nil
+		},
 	}
 
 	if err := viewRun(opts); err != nil {
@@ -622,4 +629,52 @@ func Test_ViewRun_HandlesSpecialCharacters(t *testing.T) {
 			reg.Verify(t)
 		})
 	}
+}
+
+func Test_viewRun_json(t *testing.T) {
+	io, _, stdout, stderr := iostreams.Test()
+	io.SetStdoutTTY(false)
+
+	reg := &httpmock.Registry{}
+	defer reg.Verify(t)
+	reg.StubRepoInfoResponse("OWNER", "REPO", "main")
+
+	opts := &ViewOptions{
+		IO: io,
+		HttpClient: func() (*http.Client, error) {
+			return &http.Client{Transport: reg}, nil
+		},
+		BaseRepo: func() (ghrepo.Interface, error) {
+			return ghrepo.New("OWNER", "REPO"), nil
+		},
+		Exporter: &testExporter{
+			fields: []string{"name", "defaultBranchRef"},
+		},
+	}
+
+	_, teardown := run.Stub()
+	defer teardown(t)
+
+	err := viewRun(opts)
+	assert.NoError(t, err)
+	assert.Equal(t, heredoc.Doc(`
+		name: REPO
+		defaultBranchRef: main
+	`), stdout.String())
+	assert.Equal(t, "", stderr.String())
+}
+
+type testExporter struct {
+	fields []string
+}
+
+func (e *testExporter) Fields() []string {
+	return e.fields
+}
+
+func (e *testExporter) Write(io *iostreams.IOStreams, data interface{}) error {
+	r := data.(*api.Repository)
+	fmt.Fprintf(io.Out, "name: %s\n", r.Name)
+	fmt.Fprintf(io.Out, "defaultBranchRef: %s\n", r.DefaultBranchRef.Name)
+	return nil
 }

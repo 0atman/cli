@@ -7,12 +7,11 @@ import (
 
 	"github.com/AlecAivazis/survey/v2"
 	"github.com/MakeNowJust/heredoc"
-	"github.com/cli/cli/api"
-	"github.com/cli/cli/internal/config"
-	"github.com/cli/cli/pkg/cmdutil"
-	"github.com/cli/cli/pkg/iostreams"
-	"github.com/cli/cli/pkg/prompt"
-	"github.com/cli/cli/utils"
+	"github.com/cli/cli/v2/api"
+	"github.com/cli/cli/v2/internal/config"
+	"github.com/cli/cli/v2/pkg/cmdutil"
+	"github.com/cli/cli/v2/pkg/iostreams"
+	"github.com/cli/cli/v2/pkg/prompt"
 	"github.com/spf13/cobra"
 )
 
@@ -49,7 +48,7 @@ func NewCmdLogout(f *cmdutil.Factory, runF func(*LogoutOptions) error) *cobra.Co
 		`),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if opts.Hostname == "" && !opts.IO.CanPrompt() {
-				return &cmdutil.FlagError{Err: errors.New("--hostname required when not running interactively")}
+				return cmdutil.FlagErrorf("--hostname required when not running interactively")
 			}
 
 			if runF != nil {
@@ -75,6 +74,9 @@ func logoutRun(opts *LogoutOptions) error {
 
 	candidates, err := cfg.Hosts()
 	if err != nil {
+		return err
+	}
+	if len(candidates) == 0 {
 		return fmt.Errorf("not logged in to any hosts")
 	}
 
@@ -106,6 +108,12 @@ func logoutRun(opts *LogoutOptions) error {
 	}
 
 	if err := cfg.CheckWriteable(hostname, "oauth_token"); err != nil {
+		var roErr *config.ReadOnlyEnvError
+		if errors.As(err, &roErr) {
+			fmt.Fprintf(opts.IO.ErrOut, "The value of the %s environment variable is being used for authentication.\n", roErr.Variable)
+			fmt.Fprint(opts.IO.ErrOut, "To erase credentials stored in GitHub CLI, first clear the value from the environment.\n")
+			return cmdutil.SilentError
+		}
 		return err
 	}
 
@@ -143,7 +151,7 @@ func logoutRun(opts *LogoutOptions) error {
 	}
 
 	cfg.UnsetHost(hostname)
-	err = cfg.Write()
+	err = cfg.WriteHosts()
 	if err != nil {
 		return fmt.Errorf("failed to write config, authentication configuration not updated: %w", err)
 	}
@@ -151,8 +159,9 @@ func logoutRun(opts *LogoutOptions) error {
 	isTTY := opts.IO.IsStdinTTY() && opts.IO.IsStdoutTTY()
 
 	if isTTY {
+		cs := opts.IO.ColorScheme()
 		fmt.Fprintf(opts.IO.ErrOut, "%s Logged out of %s%s\n",
-			utils.GreenCheck(), utils.Bold(hostname), usernameStr)
+			cs.SuccessIcon(), cs.Bold(hostname), usernameStr)
 	}
 
 	return nil

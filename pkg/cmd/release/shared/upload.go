@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
-	"io/ioutil"
 	"mime"
 	"net/http"
 	"net/url"
@@ -13,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cli/cli/api"
+	"github.com/cli/cli/v2/api"
 )
 
 type AssetForUpload struct {
@@ -170,6 +169,7 @@ func uploadAsset(httpClient *http.Client, uploadURL string, asset AssetForUpload
 	}
 	req.ContentLength = asset.Size
 	req.Header.Set("Content-Type", asset.MIMEType)
+	req.GetBody = asset.Open
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
@@ -182,7 +182,7 @@ func uploadAsset(httpClient *http.Client, uploadURL string, asset AssetForUpload
 		return nil, api.HandleHTTPError(resp)
 	}
 
-	b, err := ioutil.ReadAll(resp.Body)
+	b, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
 	}

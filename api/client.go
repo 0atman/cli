@@ -3,18 +3,16 @@ package api
 import (
 	"bytes"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"net/url"
 	"regexp"
 	"strings"
 
-	"github.com/cli/cli/internal/ghinstance"
+	"github.com/cli/cli/v2/internal/ghinstance"
+	graphql "github.com/cli/shurcooL-graphql"
 	"github.com/henvic/httpretty"
-	"github.com/shurcooL/graphql"
 )
 
 // ClientOption represents an argument to NewClient
@@ -99,54 +97,18 @@ func ReplaceTripper(tr http.RoundTripper) ClientOption {
 	}
 }
 
-var issuedScopesWarning bool
-
-const (
-	httpOAuthAppID  = "X-Oauth-Client-Id"
-	httpOAuthScopes = "X-Oauth-Scopes"
-)
-
-// CheckScopes checks whether an OAuth scope is present in a response
-func CheckScopes(wantedScope string, cb func(string) error) ClientOption {
-	wantedCandidates := []string{wantedScope}
-	if strings.HasPrefix(wantedScope, "read:") {
-		wantedCandidates = append(wantedCandidates, "admin:"+strings.TrimPrefix(wantedScope, "read:"))
-	}
-
+// ExtractHeader extracts a named header from any response received by this client and, if non-blank, saves
+// it to dest.
+func ExtractHeader(name string, dest *string) ClientOption {
 	return func(tr http.RoundTripper) http.RoundTripper {
 		return &funcTripper{roundTrip: func(req *http.Request) (*http.Response, error) {
 			res, err := tr.RoundTrip(req)
-			if err != nil || res.StatusCode > 299 || issuedScopesWarning {
-				return res, err
-			}
-
-			_, hasHeader := res.Header[httpOAuthAppID]
-			if !hasHeader {
-				return res, nil
-			}
-
-			appID := res.Header.Get(httpOAuthAppID)
-			hasScopes := strings.Split(res.Header.Get(httpOAuthScopes), ",")
-
-			hasWanted := false
-		outer:
-			for _, s := range hasScopes {
-				for _, w := range wantedCandidates {
-					if w == strings.TrimSpace(s) {
-						hasWanted = true
-						break outer
-					}
+			if err == nil {
+				if value := res.Header.Get(name); value != "" {
+					*dest = value
 				}
 			}
-
-			if !hasWanted {
-				if err := cb(appID); err != nil {
-					return res, err
-				}
-				issuedScopesWarning = true
-			}
-
-			return res, nil
+			return res, err
 		}}
 	}
 }
@@ -164,6 +126,10 @@ type Client struct {
 	http *http.Client
 }
 
+func (c *Client) HTTP() *http.Client {
+	return c.http
+}
+
 type graphQLResponse struct {
 	Data   interface{}
 	Errors []GraphQLError
@@ -172,8 +138,19 @@ type graphQLResponse struct {
 // GraphQLError is a single error returned in a GraphQL response
 type GraphQLError struct {
 	Type    string
-	Path    []string
 	Message string
+	Path    []interface{} // mixed strings and numbers
+}
+
+func (ge GraphQLError) PathString() string {
+	var res strings.Builder
+	for i, v := range ge.Path {
+		if i > 0 {
+			res.WriteRune('.')
+		}
+		fmt.Fprintf(&res, "%v", v)
+	}
+	return res.String()
 }
 
 // GraphQLErrorResponse contains errors returned in a GraphQL response
@@ -184,17 +161,48 @@ type GraphQLErrorResponse struct {
 func (gr GraphQLErrorResponse) Error() string {
 	errorMessages := make([]string, 0, len(gr.Errors))
 	for _, e := range gr.Errors {
-		errorMessages = append(errorMessages, e.Message)
+		msg := e.Message
+		if p := e.PathString(); p != "" {
+			msg = fmt.Sprintf("%s (%s)", msg, p)
+		}
+		errorMessages = append(errorMessages, msg)
 	}
-	return fmt.Sprintf("GraphQL error: %s", strings.Join(errorMessages, "\n"))
+	return fmt.Sprintf("GraphQL: %s", strings.Join(errorMessages, ", "))
+}
+
+// Match checks if this error is only about a specific type on a specific path. If the path argument ends
+// with a ".", it will match all its subpaths as well.
+func (gr GraphQLErrorResponse) Match(expectType, expectPath string) bool {
+	for _, e := range gr.Errors {
+		if e.Type != expectType || !matchPath(e.PathString(), expectPath) {
+			return false
+		}
+	}
+	return true
+}
+
+func matchPath(p, expect string) bool {
+	if strings.HasSuffix(expect, ".") {
+		return strings.HasPrefix(p, expect) || p == strings.TrimSuffix(expect, ".")
+	}
+	return p == expect
 }
 
 // HTTPError is an error returned by a failed API call
 type HTTPError struct {
-	StatusCode  int
-	RequestURL  *url.URL
-	Message     string
-	OAuthScopes string
+	StatusCode int
+	RequestURL *url.URL
+	Message    string
+	Errors     []HTTPErrorItem
+
+	scopesSuggestion string
+}
+
+type HTTPErrorItem struct {
+	Message  string
+	Resource string
+	Field    string
+	Code     string
 }
 
 func (err HTTPError) Error() string {
@@ -206,64 +214,79 @@ func (err HTTPError) Error() string {
 	return fmt.Sprintf("HTTP %d (%s)", err.StatusCode, err.RequestURL)
 }
 
-type MissingScopesError struct {
-	error
+func (err HTTPError) ScopesSuggestion() string {
+	return err.scopesSuggestion
 }
 
-func (c Client) HasMinimumScopes(hostname string) error {
-	apiEndpoint := ghinstance.RESTPrefix(hostname)
-
-	req, err := http.NewRequest("GET", apiEndpoint, nil)
-	if err != nil {
-		return err
+// ScopesSuggestion is an error messaging utility that prints the suggestion to request additional OAuth
+// scopes in case a server response indicates that there are missing scopes.
+func ScopesSuggestion(resp *http.Response) string {
+	if resp.StatusCode < 400 || resp.StatusCode > 499 || resp.StatusCode == 422 {
+		return ""
 	}
 
-	req.Header.Set("Content-Type", "application/json; charset=utf-8")
-	res, err := c.http.Do(req)
-	if err != nil {
-		return err
+	endpointNeedsScopes := resp.Header.Get("X-Accepted-Oauth-Scopes")
+	tokenHasScopes := resp.Header.Get("X-Oauth-Scopes")
+	if tokenHasScopes == "" {
+		return ""
 	}
 
-	defer func() {
-		// Ensure the response body is fully read and closed
-		// before we reconnect, so that we reuse the same TCPconnection.
-		_, _ = io.Copy(ioutil.Discard, res.Body)
-		res.Body.Close()
-	}()
+	gotScopes := map[string]struct{}{}
+	for _, s := range strings.Split(tokenHasScopes, ",") {
+		s = strings.TrimSpace(s)
+		gotScopes[s] = struct{}{}
 
-	if res.StatusCode != 200 {
-		return HandleHTTPError(res)
+		// Certain scopes may be grouped under a single "top-level" scope. The following branch
+		// statements include these grouped/implied scopes when the top-level scope is encountered.
+		// See https://docs.github.com/en/developers/apps/building-oauth-apps/scopes-for-oauth-apps.
+		if s == "repo" {
+			gotScopes["repo:status"] = struct{}{}
+			gotScopes["repo_deployment"] = struct{}{}
+			gotScopes["public_repo"] = struct{}{}
+			gotScopes["repo:invite"] = struct{}{}
+			gotScopes["security_events"] = struct{}{}
+		} else if s == "user" {
+			gotScopes["read:user"] = struct{}{}
+			gotScopes["user:email"] = struct{}{}
+			gotScopes["user:follow"] = struct{}{}
+		} else if s == "codespace" {
+			gotScopes["codespace:secrets"] = struct{}{}
+		} else if strings.HasPrefix(s, "admin:") {
+			gotScopes["read:"+strings.TrimPrefix(s, "admin:")] = struct{}{}
+			gotScopes["write:"+strings.TrimPrefix(s, "admin:")] = struct{}{}
+		} else if strings.HasPrefix(s, "write:") {
+			gotScopes["read:"+strings.TrimPrefix(s, "write:")] = struct{}{}
+		}
 	}
 
-	hasScopes := strings.Split(res.Header.Get("X-Oauth-Scopes"), ",")
-
-	search := map[string]bool{
-		"repo":      false,
-		"read:org":  false,
-		"admin:org": false,
+	for _, s := range strings.Split(endpointNeedsScopes, ",") {
+		s = strings.TrimSpace(s)
+		if _, gotScope := gotScopes[s]; s == "" || gotScope {
+			continue
+		}
+		return fmt.Sprintf(
+			"This API operation needs the %[1]q scope. To request it, run:  gh auth refresh -h %[2]s -s %[1]s",
+			s,
+			ghinstance.NormalizeHostname(resp.Request.URL.Hostname()),
+		)
 	}
 
-	for _, s := range hasScopes {
-		search[strings.TrimSpace(s)] = true
-	}
-
-	errorMsgs := []string{}
-	if !search["repo"] {
-		errorMsgs = append(errorMsgs, "missing required scope 'repo'")
-	}
-
-	if !search["read:org"] && !search["admin:org"] {
-		errorMsgs = append(errorMsgs, "missing required scope 'read:org'")
-	}
-
-	if len(errorMsgs) > 0 {
-		return &MissingScopesError{error: errors.New(strings.Join(errorMsgs, ";"))}
-	}
-
-	return nil
+	return ""
 }
 
-// GraphQL performs a GraphQL request and parses the response
+// EndpointNeedsScopes adds additional OAuth scopes to an HTTP response as if they were returned from the
+// server endpoint. This improves HTTP 4xx error messaging for endpoints that don't explicitly list the
+// OAuth scopes they need.
+func EndpointNeedsScopes(resp *http.Response, s string) *http.Response {
+	if resp.StatusCode >= 400 && resp.StatusCode < 500 {
+		oldScopes := resp.Header.Get("X-Accepted-Oauth-Scopes")
+		resp.Header.Set("X-Accepted-Oauth-Scopes", fmt.Sprintf("%s, %s", oldScopes, s))
+	}
+	return resp
+}
+
+// GraphQL performs a GraphQL request and parses the response. If there are errors in the response,
+// *GraphQLErrorResponse will be returned, but the data will also be parsed into the receiver.
 func (c Client) GraphQL(hostname string, query string, variables map[string]interface{}, data interface{}) error {
 	reqBody, err := json.Marshal(map[string]interface{}{"query": query, "variables": variables})
 	if err != nil {
@@ -292,40 +315,60 @@ func graphQLClient(h *http.Client, hostname string) *graphql.Client {
 
 // REST performs a REST request and parses the response.
 func (c Client) REST(hostname string, method string, p string, body io.Reader, data interface{}) error {
-	url := ghinstance.RESTPrefix(hostname) + p
-	req, err := http.NewRequest(method, url, body)
+	_, err := c.RESTWithNext(hostname, method, p, body, data)
+	return err
+}
+
+func (c Client) RESTWithNext(hostname string, method string, p string, body io.Reader, data interface{}) (string, error) {
+	req, err := http.NewRequest(method, restURL(hostname, p), body)
 	if err != nil {
-		return err
+		return "", err
 	}
 
 	req.Header.Set("Content-Type", "application/json; charset=utf-8")
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer resp.Body.Close()
 
 	success := resp.StatusCode >= 200 && resp.StatusCode < 300
 	if !success {
-		return HandleHTTPError(resp)
+		return "", HandleHTTPError(resp)
 	}
 
 	if resp.StatusCode == http.StatusNoContent {
-		return nil
+		return "", nil
 	}
 
-	b, err := ioutil.ReadAll(resp.Body)
+	b, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return err
+		return "", err
 	}
 
 	err = json.Unmarshal(b, &data)
 	if err != nil {
-		return err
+		return "", err
 	}
 
-	return nil
+	var next string
+	for _, m := range linkRE.FindAllStringSubmatch(resp.Header.Get("Link"), -1) {
+		if len(m) > 2 && m[2] == "next" {
+			next = m[1]
+		}
+	}
+
+	return next, nil
+}
+
+var linkRE = regexp.MustCompile(`<([^>]+)>;\s*rel="([^"]+)"`)
+
+func restURL(hostname string, pathOrURL string) string {
+	if strings.HasPrefix(pathOrURL, "https://") || strings.HasPrefix(pathOrURL, "http://") {
+		return pathOrURL
+	}
+	return ghinstance.RESTPrefix(hostname) + pathOrURL
 }
 
 func handleResponse(resp *http.Response, data interface{}) error {
@@ -335,7 +378,7 @@ func handleResponse(resp *http.Response, data interface{}) error {
 		return HandleHTTPError(resp)
 	}
 
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return err
 	}
@@ -354,9 +397,9 @@ func handleResponse(resp *http.Response, data interface{}) error {
 
 func HandleHTTPError(resp *http.Response) error {
 	httpError := HTTPError{
-		StatusCode:  resp.StatusCode,
-		RequestURL:  resp.Request.URL,
-		OAuthScopes: resp.Header.Get("X-Oauth-Scopes"),
+		StatusCode:       resp.StatusCode,
+		RequestURL:       resp.Request.URL,
+		scopesSuggestion: ScopesSuggestion(resp),
 	}
 
 	if !jsonTypeRE.MatchString(resp.Header.Get("Content-Type")) {
@@ -364,7 +407,7 @@ func HandleHTTPError(resp *http.Response) error {
 		return httpError
 	}
 
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		httpError.Message = err.Error()
 		return httpError
@@ -378,30 +421,28 @@ func HandleHTTPError(resp *http.Response) error {
 		return httpError
 	}
 
-	type errorObject struct {
-		Message  string
-		Resource string
-		Field    string
-		Code     string
+	var messages []string
+	if parsedBody.Message != "" {
+		messages = append(messages, parsedBody.Message)
 	}
-
-	messages := []string{parsedBody.Message}
 	for _, raw := range parsedBody.Errors {
 		switch raw[0] {
 		case '"':
 			var errString string
 			_ = json.Unmarshal(raw, &errString)
 			messages = append(messages, errString)
+			httpError.Errors = append(httpError.Errors, HTTPErrorItem{Message: errString})
 		case '{':
-			var errInfo errorObject
+			var errInfo HTTPErrorItem
 			_ = json.Unmarshal(raw, &errInfo)
 			msg := errInfo.Message
-			if errInfo.Code != "custom" {
+			if errInfo.Code != "" && errInfo.Code != "custom" {
 				msg = fmt.Sprintf("%s.%s %s", errInfo.Resource, errInfo.Field, errorCodeToMessage(errInfo.Code))
 			}
 			if msg != "" {
 				messages = append(messages, msg)
 			}
+			httpError.Errors = append(httpError.Errors, errInfo)
 		}
 	}
 	httpError.Message = strings.Join(messages, "\n")

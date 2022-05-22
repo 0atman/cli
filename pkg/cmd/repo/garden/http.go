@@ -4,13 +4,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"strings"
 	"time"
 
-	"github.com/cli/cli/internal/ghinstance"
-	"github.com/cli/cli/internal/ghrepo"
+	"github.com/cli/cli/v2/internal/ghinstance"
+	"github.com/cli/cli/v2/internal/ghrepo"
 )
 
 func getCommits(client *http.Client, repo ghrepo.Interface, maxCommits int) ([]*Commit, error) {
@@ -36,7 +36,7 @@ func getCommits(client *http.Client, repo ghrepo.Interface, maxCommits int) ([]*
 			break
 		}
 		result := Result{}
-		resp, err := getResponse(client, pathF(page), &result)
+		resp, err := getResponse(client, repo.RepoHost(), pathF(page), &result)
 		if err != nil {
 			return nil, err
 		}
@@ -53,7 +53,7 @@ func getCommits(client *http.Client, repo ghrepo.Interface, maxCommits int) ([]*
 			})
 		}
 		link := resp.Header["Link"]
-		if !strings.Contains(link[0], "last") {
+		if len(link) == 0 || !strings.Contains(link[0], "last") {
 			paginating = false
 		}
 		page++
@@ -68,8 +68,8 @@ func getCommits(client *http.Client, repo ghrepo.Interface, maxCommits int) ([]*
 	return commits, nil
 }
 
-func getResponse(client *http.Client, path string, data interface{}) (*http.Response, error) {
-	url := ghinstance.RESTPrefix(ghinstance.OverridableDefault()) + path
+func getResponse(client *http.Client, host, path string, data interface{}) (*http.Response, error) {
+	url := ghinstance.RESTPrefix(host) + path
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return nil, err
@@ -91,7 +91,7 @@ func getResponse(client *http.Client, path string, data interface{}) (*http.Resp
 		return resp, nil
 	}
 
-	b, err := ioutil.ReadAll(resp.Body)
+	b, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
 	}

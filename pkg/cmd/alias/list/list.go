@@ -5,10 +5,10 @@ import (
 	"sort"
 
 	"github.com/MakeNowJust/heredoc"
-	"github.com/cli/cli/internal/config"
-	"github.com/cli/cli/pkg/cmdutil"
-	"github.com/cli/cli/pkg/iostreams"
-	"github.com/cli/cli/utils"
+	"github.com/cli/cli/v2/internal/config"
+	"github.com/cli/cli/v2/pkg/cmdutil"
+	"github.com/cli/cli/v2/pkg/iostreams"
+	"github.com/cli/cli/v2/utils"
 	"github.com/spf13/cobra"
 )
 
@@ -24,8 +24,9 @@ func NewCmdList(f *cmdutil.Factory, runF func(*ListOptions) error) *cobra.Comman
 	}
 
 	cmd := &cobra.Command{
-		Use:   "list",
-		Short: "List your aliases",
+		Use:     "list",
+		Short:   "List your aliases",
+		Aliases: []string{"ls"},
 		Long: heredoc.Doc(`
 			This command prints out all of the aliases gh is configured to use.
 		`),
@@ -53,10 +54,7 @@ func listRun(opts *ListOptions) error {
 	}
 
 	if aliasCfg.Empty() {
-		if opts.IO.IsStdoutTTY() {
-			fmt.Fprintf(opts.IO.ErrOut, "no aliases configured\n")
-		}
-		return nil
+		return cmdutil.NewNoResultsError("no aliases configured")
 	}
 
 	tp := utils.NewTablePrinter(opts.IO)

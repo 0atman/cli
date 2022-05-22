@@ -3,18 +3,19 @@ project_name: gh
 release:
   prerelease: auto
   draft: true # we only publish after the Windows MSI gets uploaded
+  name_template: "GitHub CLI {{.Version}}"
 
 before:
   hooks:
     - go mod tidy
-    - make manpages
+    - make manpages GH_VERSION={{.Version}}
 
 builds:
   - <<: &build_defaults
       binary: bin/gh
       main: ./cmd/gh
       ldflags:
-        - -s -w -X github.com/cli/cli/command.Version={{.Version}} -X github.com/cli/cli/command.BuildDate={{time "2006-01-02"}}
+        - -s -w -X github.com/cli/cli/v2/internal/build.Version={{.Version}} -X github.com/cli/cli/v2/internal/build.Date={{time "2006-01-02"}}
         - -X main.updaterEnabled=cli/cli
     id: macos
     goos: [darwin]
@@ -23,12 +24,17 @@ builds:
   - <<: *build_defaults
     id: linux
     goos: [linux]
-    goarch: [386, amd64, arm64]
+    goarch: [386, arm, amd64, arm64]
+    env:
+      - CGO_ENABLED=0
 
   - <<: *build_defaults
     id: windows
     goos: [windows]
     goarch: [386, amd64]
+    hooks:
+      post:
+        - ./script/sign-windows-executable.sh '{{ .Path }}'
 
 archives:
   - id: nix
@@ -54,24 +60,13 @@ nfpms:
   - license: MIT
     maintainer: GitHub
     homepage: https://github.com/cli/cli
-    bindir: /usr/local
+    bindir: /usr/bin
     dependencies:
       - git
     description: GitHub’s official command line tool.
     formats:
       - deb
       - rpm
-    files:
-      "./share/man/man1/gh*.1": "/usr/share/man/man1"
-
-scoop:
-  bucket:
-    owner: cli
-    name: scoop-gh
-  commit_author:
-    name: vilmibm
-    email: vilmibm@github.com
-  homepage: https://github.com/cli/cli
-  skip_upload: auto
-  description: GitHub CLI
-  license: MIT
+    contents:
+      - src: "./share/man/man1/gh*.1"
+        dst: "/usr/share/man/man1"

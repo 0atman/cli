@@ -2,42 +2,74 @@ package checks
 
 import (
 	"bytes"
-	"net/http"
+	"encoding/json"
+	"io"
+	"os"
+	"reflect"
 	"testing"
+	"time"
 
-	"github.com/cli/cli/internal/ghrepo"
-	"github.com/cli/cli/pkg/cmdutil"
-	"github.com/cli/cli/pkg/httpmock"
-	"github.com/cli/cli/pkg/iostreams"
+	"github.com/cli/cli/v2/api"
+	"github.com/cli/cli/v2/internal/ghrepo"
+	"github.com/cli/cli/v2/internal/run"
+	"github.com/cli/cli/v2/pkg/cmd/pr/shared"
+	"github.com/cli/cli/v2/pkg/cmdutil"
+	"github.com/cli/cli/v2/pkg/iostreams"
 	"github.com/google/shlex"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestNewCmdChecks(t *testing.T) {
 	tests := []struct {
-		name  string
-		cli   string
-		wants ChecksOptions
+		name       string
+		cli        string
+		wants      ChecksOptions
+		wantsError string
 	}{
 		{
-			name:  "no arguments",
-			cli:   "",
-			wants: ChecksOptions{},
+			name: "no arguments",
+			cli:  "",
+			wants: ChecksOptions{
+				Interval: time.Duration(10000000000),
+			},
 		},
 		{
 			name: "pr argument",
 			cli:  "1234",
 			wants: ChecksOptions{
 				SelectorArg: "1234",
+				Interval:    time.Duration(10000000000),
 			},
+		},
+		{
+			name: "watch flag",
+			cli:  "--watch",
+			wants: ChecksOptions{
+				Watch:    true,
+				Interval: time.Duration(10000000000),
+			},
+		},
+		{
+			name: "watch flag and interval flag",
+			cli:  "--watch --interval 5",
+			wants: ChecksOptions{
+				Watch:    true,
+				Interval: time.Duration(5000000000),
+			},
+		},
+		{
+			name:       "interval flag without watch flag",
+			cli:        "--interval 5",
+			wantsError: "cannot use `--interval` flag without `--watch` flag",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			io, _, _, _ := iostreams.Test()
+			ios, _, _, _ := iostreams.Test()
 			f := &cmdutil.Factory{
-				IOStreams: io,
+				IOStreams: ios,
 			}
 
 			argv, err := shlex.Split(tt.cli)
@@ -54,9 +86,14 @@ func TestNewCmdChecks(t *testing.T) {
 			cmd.SetErr(&bytes.Buffer{})
 
 			_, err = cmd.ExecuteC()
+			if tt.wantsError != "" {
+				assert.EqualError(t, err, tt.wantsError)
+				return
+			}
 			assert.NoError(t, err)
-
 			assert.Equal(t, tt.wants.SelectorArg, gotOpts.SelectorArg)
+			assert.Equal(t, tt.wants.Watch, gotOpts.Watch)
+			assert.Equal(t, tt.wants.Interval, gotOpts.Interval)
 		})
 	}
 }
@@ -65,147 +102,382 @@ func Test_checksRun(t *testing.T) {
 	tests := []struct {
 		name    string
 		fixture string
-		stubs   func(*httpmock.Registry)
-		wantOut string
+		prJSON  string
 		nontty  bool
-		wantErr bool
+		wantOut string
+		wantErr string
 	}{
 		{
-			name: "no commits",
-			stubs: func(reg *httpmock.Registry) {
-				reg.Register(
-					httpmock.GraphQL(`query PullRequestByNumber\b`),
-					httpmock.JSONResponse(
-						bytes.NewBufferString(`
-					{ "data": { "repository": {
-						"pullRequest": { "number": 123 }
-					} } }
-				`)))
-			},
+			name:    "no commits",
+			prJSON:  `{ "number": 123 }`,
+			wantOut: "",
+			wantErr: "no commit found on the pull request",
 		},
 		{
-			name: "no checks",
-			stubs: func(reg *httpmock.Registry) {
-				reg.StubResponse(200, bytes.NewBufferString(`
-				  { "data": { "repository": {
-				  	"pullRequest": { "number": 123, "commits": { "nodes": [{"commit": {"oid": "abc"}}]} }
-				  } } }
-				`))
-			},
+			name:    "no checks",
+			prJSON:  `{ "number": 123, "statusCheckRollup": { "nodes": [{"commit": {"oid": "abc"}}]}, "headRefName": "master" }`,
+			wantOut: "",
+			wantErr: "no checks reported on the 'master' branch",
 		},
 		{
 			name:    "some failing",
 			fixture: "./fixtures/someFailing.json",
-			wantOut: "Some checks were not successful\n1 failing, 1 successful, and 1 pending checks\n\nX  sad tests   1m26s  sweet link\n✓  cool tests  1m26s  sweet link\n-  slow tests  1m26s  sweet link\n",
-			wantErr: true,
+			wantOut: "Some checks were not successful\n1 failing, 1 successful, 0 skipped, and 1 pending checks\n\nX  sad tests   1m26s  sweet link\n✓  cool tests  1m26s  sweet link\n*  slow tests  1m26s  sweet link\n",
+			wantErr: "SilentError",
 		},
 		{
 			name:    "some pending",
 			fixture: "./fixtures/somePending.json",
-			wantOut: "Some checks are still pending\n0 failing, 2 successful, and 1 pending checks\n\n✓  cool tests  1m26s  sweet link\n✓  rad tests   1m26s  sweet link\n-  slow tests  1m26s  sweet link\n",
-			wantErr: true,
+			wantOut: "Some checks are still pending\n0 failing, 2 successful, 0 skipped, and 1 pending checks\n\n✓  cool tests  1m26s  sweet link\n✓  rad tests   1m26s  sweet link\n*  slow tests  1m26s  sweet link\n",
+			wantErr: "SilentError",
 		},
 		{
 			name:    "all passing",
 			fixture: "./fixtures/allPassing.json",
-			wantOut: "All checks were successful\n0 failing, 3 successful, and 0 pending checks\n\n✓  awesome tests  1m26s  sweet link\n✓  cool tests     1m26s  sweet link\n✓  rad tests      1m26s  sweet link\n",
+			wantOut: "All checks were successful\n0 failing, 3 successful, 0 skipped, and 0 pending checks\n\n✓  awesome tests  1m26s  sweet link\n✓  cool tests     1m26s  sweet link\n✓  rad tests      1m26s  sweet link\n",
+			wantErr: "",
 		},
 		{
 			name:    "with statuses",
 			fixture: "./fixtures/withStatuses.json",
-			wantOut: "Some checks were not successful\n1 failing, 2 successful, and 0 pending checks\n\nX  a status           sweet link\n✓  cool tests  1m26s  sweet link\n✓  rad tests   1m26s  sweet link\n",
-			wantErr: true,
+			wantOut: "Some checks were not successful\n1 failing, 2 successful, 0 skipped, and 0 pending checks\n\nX  a status           sweet link\n✓  cool tests  1m26s  sweet link\n✓  rad tests   1m26s  sweet link\n",
+			wantErr: "SilentError",
 		},
 		{
-			name:   "no commits",
-			nontty: true,
-			stubs: func(reg *httpmock.Registry) {
-				reg.Register(
-					httpmock.GraphQL(`query PullRequestByNumber\b`),
-					httpmock.JSONResponse(
-						bytes.NewBufferString(`
-					{ "data": { "repository": {
-						"pullRequest": { "number": 123 }
-					} } }
-				`)))
-			},
-		},
-		{
-			name:   "no checks",
-			nontty: true,
-			stubs: func(reg *httpmock.Registry) {
-				reg.StubResponse(200, bytes.NewBufferString(`
-				  { "data": { "repository": {
-						"pullRequest": { "number": 123, "commits": { "nodes": [{"commit": {"oid": "abc"}}]} }
-				  } } }
-				`))
-			},
+			name:    "no checks",
+			nontty:  true,
+			prJSON:  `{ "number": 123, "statusCheckRollup": { "nodes": [{"commit": {"oid": "abc"}}]}, "headRefName": "master" }`,
+			wantOut: "",
+			wantErr: "no checks reported on the 'master' branch",
 		},
 		{
 			name:    "some failing",
 			nontty:  true,
 			fixture: "./fixtures/someFailing.json",
 			wantOut: "sad tests\tfail\t1m26s\tsweet link\ncool tests\tpass\t1m26s\tsweet link\nslow tests\tpending\t1m26s\tsweet link\n",
-			wantErr: true,
+			wantErr: "SilentError",
 		},
 		{
 			name:    "some pending",
 			nontty:  true,
 			fixture: "./fixtures/somePending.json",
 			wantOut: "cool tests\tpass\t1m26s\tsweet link\nrad tests\tpass\t1m26s\tsweet link\nslow tests\tpending\t1m26s\tsweet link\n",
-			wantErr: true,
+			wantErr: "SilentError",
 		},
 		{
 			name:    "all passing",
 			nontty:  true,
 			fixture: "./fixtures/allPassing.json",
 			wantOut: "awesome tests\tpass\t1m26s\tsweet link\ncool tests\tpass\t1m26s\tsweet link\nrad tests\tpass\t1m26s\tsweet link\n",
+			wantErr: "",
 		},
 		{
 			name:    "with statuses",
 			nontty:  true,
 			fixture: "./fixtures/withStatuses.json",
 			wantOut: "a status\tfail\t0\tsweet link\ncool tests\tpass\t1m26s\tsweet link\nrad tests\tpass\t1m26s\tsweet link\n",
-			wantErr: true,
+			wantErr: "SilentError",
+		},
+		{
+			name:    "some skipped",
+			fixture: "./fixtures/someSkipping.json",
+			wantOut: "All checks were successful\n0 failing, 1 successful, 2 skipped, and 0 pending checks\n\n✓  cool tests  1m26s  sweet link\n-  rad tests   1m26s  sweet link\n-  skip tests  1m26s  sweet link\n",
+			wantErr: "",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			io, _, stdout, _ := iostreams.Test()
-			io.SetStdoutTTY(!tt.nontty)
+			ios, _, stdout, _ := iostreams.Test()
+			ios.SetStdoutTTY(!tt.nontty)
+
+			var response *api.PullRequest
+			var jsonReader io.Reader
+			if tt.fixture != "" {
+				ff, err := os.Open(tt.fixture)
+				require.NoError(t, err)
+				defer ff.Close()
+				jsonReader = ff
+			} else {
+				jsonReader = bytes.NewBufferString(tt.prJSON)
+			}
+			dec := json.NewDecoder(jsonReader)
+			require.NoError(t, dec.Decode(&response))
 
 			opts := &ChecksOptions{
-				IO: io,
-				BaseRepo: func() (ghrepo.Interface, error) {
-					return ghrepo.New("OWNER", "REPO"), nil
-				},
+				IO:          ios,
 				SelectorArg: "123",
-			}
-
-			reg := &httpmock.Registry{}
-			if tt.stubs != nil {
-				tt.stubs(reg)
-			} else if tt.fixture != "" {
-				reg.Register(
-					httpmock.GraphQL(`query PullRequestByNumber\b`), httpmock.FileResponse(tt.fixture))
-			} else {
-				panic("need either stubs or fixture key")
-			}
-
-			opts.HttpClient = func() (*http.Client, error) {
-				return &http.Client{Transport: reg}, nil
+				Finder:      shared.NewMockFinder("123", response, ghrepo.New("OWNER", "REPO")),
 			}
 
 			err := checksRun(opts)
-			if tt.wantErr {
-				assert.Equal(t, "SilentError", err.Error())
+			if tt.wantErr != "" {
+				assert.EqualError(t, err, tt.wantErr)
 			} else {
 				assert.NoError(t, err)
 			}
 
 			assert.Equal(t, tt.wantOut, stdout.String())
-			reg.Verify(t)
+		})
+	}
+}
+
+func TestChecksRun_web(t *testing.T) {
+	tests := []struct {
+		name       string
+		isTTY      bool
+		wantStderr string
+		wantStdout string
+		wantBrowse string
+	}{
+		{
+			name:       "tty",
+			isTTY:      true,
+			wantStderr: "Opening github.com/OWNER/REPO/pull/123/checks in your browser.\n",
+			wantStdout: "",
+			wantBrowse: "https://github.com/OWNER/REPO/pull/123/checks",
+		},
+		{
+			name:       "nontty",
+			isTTY:      false,
+			wantStderr: "",
+			wantStdout: "",
+			wantBrowse: "https://github.com/OWNER/REPO/pull/123/checks",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			browser := &cmdutil.TestBrowser{}
+
+			ios, _, stdout, stderr := iostreams.Test()
+			ios.SetStdoutTTY(tc.isTTY)
+			ios.SetStdinTTY(tc.isTTY)
+			ios.SetStderrTTY(tc.isTTY)
+
+			_, teardown := run.Stub()
+			defer teardown(t)
+
+			err := checksRunWebMode(&ChecksOptions{
+				IO:          ios,
+				Browser:     browser,
+				WebMode:     true,
+				SelectorArg: "123",
+				Finder:      shared.NewMockFinder("123", &api.PullRequest{Number: 123}, ghrepo.New("OWNER", "REPO")),
+			})
+			assert.NoError(t, err)
+			assert.Equal(t, tc.wantStdout, stdout.String())
+			assert.Equal(t, tc.wantStderr, stderr.String())
+			browser.Verify(t, tc.wantBrowse)
+		})
+	}
+}
+
+func TestEliminateDupulicates(t *testing.T) {
+	tests := []struct {
+		name          string
+		checkContexts []api.CheckContext
+		want          []api.CheckContext
+	}{
+		{
+			name: "duplicate CheckRun (lint)",
+			checkContexts: []api.CheckContext{
+				{
+					TypeName:    "CheckRun",
+					Name:        "build (ubuntu-latest)",
+					Status:      "COMPLETED",
+					Conclusion:  "SUCCESS",
+					StartedAt:   time.Date(2022, 1, 1, 1, 1, 1, 1, time.UTC),
+					CompletedAt: time.Date(2022, 1, 1, 1, 1, 1, 1, time.UTC),
+					DetailsURL:  "https://github.com/cli/cli/runs/1",
+				},
+				{
+					TypeName:    "CheckRun",
+					Name:        "lint",
+					Status:      "COMPLETED",
+					Conclusion:  "FAILURE",
+					StartedAt:   time.Date(2022, 1, 1, 1, 1, 1, 1, time.UTC),
+					CompletedAt: time.Date(2022, 1, 1, 1, 1, 1, 1, time.UTC),
+					DetailsURL:  "https://github.com/cli/cli/runs/2",
+				},
+				{
+					TypeName:    "CheckRun",
+					Name:        "lint",
+					Status:      "COMPLETED",
+					Conclusion:  "SUCCESS",
+					StartedAt:   time.Date(2022, 2, 2, 2, 2, 2, 2, time.UTC),
+					CompletedAt: time.Date(2022, 2, 2, 2, 2, 2, 2, time.UTC),
+					DetailsURL:  "https://github.com/cli/cli/runs/3",
+				},
+			},
+			want: []api.CheckContext{
+				{
+					TypeName:    "CheckRun",
+					Name:        "lint",
+					Status:      "COMPLETED",
+					Conclusion:  "SUCCESS",
+					StartedAt:   time.Date(2022, 2, 2, 2, 2, 2, 2, time.UTC),
+					CompletedAt: time.Date(2022, 2, 2, 2, 2, 2, 2, time.UTC),
+					DetailsURL:  "https://github.com/cli/cli/runs/3",
+				},
+				{
+					TypeName:    "CheckRun",
+					Name:        "build (ubuntu-latest)",
+					Status:      "COMPLETED",
+					Conclusion:  "SUCCESS",
+					StartedAt:   time.Date(2022, 1, 1, 1, 1, 1, 1, time.UTC),
+					CompletedAt: time.Date(2022, 1, 1, 1, 1, 1, 1, time.UTC),
+					DetailsURL:  "https://github.com/cli/cli/runs/1",
+				},
+			},
+		},
+		{
+			name: "duplicate StatusContext (Windows GPU)",
+			checkContexts: []api.CheckContext{
+				{
+					TypeName:    "StatusContext",
+					Name:        "",
+					Context:     "Windows GPU",
+					State:       "FAILURE",
+					Status:      "",
+					Conclusion:  "",
+					StartedAt:   time.Date(2022, 1, 1, 1, 1, 1, 1, time.UTC),
+					CompletedAt: time.Date(2022, 1, 1, 1, 1, 1, 1, time.UTC),
+					DetailsURL:  "",
+					TargetURL:   "https://github.com/cli/cli/2",
+				},
+				{
+					TypeName:    "StatusContext",
+					Name:        "",
+					Context:     "Windows GPU",
+					State:       "SUCCESS",
+					Status:      "",
+					Conclusion:  "",
+					StartedAt:   time.Date(2022, 2, 2, 2, 2, 2, 2, time.UTC),
+					CompletedAt: time.Date(2022, 2, 2, 2, 2, 2, 2, time.UTC),
+					DetailsURL:  "",
+					TargetURL:   "https://github.com/cli/cli/3",
+				},
+				{
+					TypeName:    "StatusContext",
+					Name:        "",
+					Context:     "Linux GPU",
+					State:       "SUCCESS",
+					Status:      "",
+					Conclusion:  "",
+					StartedAt:   time.Date(2022, 1, 1, 1, 1, 1, 1, time.UTC),
+					CompletedAt: time.Date(2022, 1, 1, 1, 1, 1, 1, time.UTC),
+					DetailsURL:  "",
+					TargetURL:   "https://github.com/cli/cli/1",
+				},
+			},
+			want: []api.CheckContext{
+				{
+					TypeName:    "StatusContext",
+					Name:        "",
+					Context:     "Windows GPU",
+					State:       "SUCCESS",
+					Status:      "",
+					Conclusion:  "",
+					StartedAt:   time.Date(2022, 2, 2, 2, 2, 2, 2, time.UTC),
+					CompletedAt: time.Date(2022, 2, 2, 2, 2, 2, 2, time.UTC),
+					DetailsURL:  "",
+					TargetURL:   "https://github.com/cli/cli/3",
+				},
+				{
+					TypeName:    "StatusContext",
+					Name:        "",
+					Context:     "Linux GPU",
+					State:       "SUCCESS",
+					Status:      "",
+					Conclusion:  "",
+					StartedAt:   time.Date(2022, 1, 1, 1, 1, 1, 1, time.UTC),
+					CompletedAt: time.Date(2022, 1, 1, 1, 1, 1, 1, time.UTC),
+					DetailsURL:  "",
+					TargetURL:   "https://github.com/cli/cli/1",
+				},
+			},
+		},
+		{
+			name: "unique CheckContext",
+			checkContexts: []api.CheckContext{
+				{
+					TypeName:    "CheckRun",
+					Name:        "build (ubuntu-latest)",
+					Status:      "COMPLETED",
+					Conclusion:  "SUCCESS",
+					StartedAt:   time.Date(2022, 1, 1, 1, 1, 1, 1, time.UTC),
+					CompletedAt: time.Date(2022, 1, 1, 1, 1, 1, 1, time.UTC),
+					DetailsURL:  "https://github.com/cli/cli/runs/1",
+				},
+				{
+					TypeName:    "StatusContext",
+					Name:        "",
+					Context:     "Windows GPU",
+					State:       "SUCCESS",
+					Status:      "",
+					Conclusion:  "",
+					StartedAt:   time.Date(2022, 1, 1, 1, 1, 1, 1, time.UTC),
+					CompletedAt: time.Date(2022, 1, 1, 1, 1, 1, 1, time.UTC),
+					DetailsURL:  "",
+					TargetURL:   "https://github.com/cli/cli/2",
+				},
+				{
+					TypeName:    "StatusContext",
+					Name:        "",
+					Context:     "Linux GPU",
+					State:       "SUCCESS",
+					Status:      "",
+					Conclusion:  "",
+					StartedAt:   time.Date(2022, 1, 1, 1, 1, 1, 1, time.UTC),
+					CompletedAt: time.Date(2022, 1, 1, 1, 1, 1, 1, time.UTC),
+					DetailsURL:  "",
+					TargetURL:   "https://github.com/cli/cli/3",
+				},
+			},
+			want: []api.CheckContext{
+				{
+					TypeName:    "CheckRun",
+					Name:        "build (ubuntu-latest)",
+					Status:      "COMPLETED",
+					Conclusion:  "SUCCESS",
+					StartedAt:   time.Date(2022, 1, 1, 1, 1, 1, 1, time.UTC),
+					CompletedAt: time.Date(2022, 1, 1, 1, 1, 1, 1, time.UTC),
+					DetailsURL:  "https://github.com/cli/cli/runs/1",
+				},
+				{
+					TypeName:    "StatusContext",
+					Name:        "",
+					Context:     "Windows GPU",
+					State:       "SUCCESS",
+					Status:      "",
+					Conclusion:  "",
+					StartedAt:   time.Date(2022, 1, 1, 1, 1, 1, 1, time.UTC),
+					CompletedAt: time.Date(2022, 1, 1, 1, 1, 1, 1, time.UTC),
+					DetailsURL:  "",
+					TargetURL:   "https://github.com/cli/cli/2",
+				},
+				{
+					TypeName:    "StatusContext",
+					Name:        "",
+					Context:     "Linux GPU",
+					State:       "SUCCESS",
+					Status:      "",
+					Conclusion:  "",
+					StartedAt:   time.Date(2022, 1, 1, 1, 1, 1, 1, time.UTC),
+					CompletedAt: time.Date(2022, 1, 1, 1, 1, 1, 1, time.UTC),
+					DetailsURL:  "",
+					TargetURL:   "https://github.com/cli/cli/3",
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := eliminateDuplicates(tt.checkContexts)
+			if !reflect.DeepEqual(tt.want, got) {
+				t.Errorf("got eliminateDuplicates %+v, want %+v\n", got, tt.want)
+			}
 		})
 	}
 }

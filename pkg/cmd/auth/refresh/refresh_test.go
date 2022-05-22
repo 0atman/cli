@@ -2,14 +2,16 @@ package refresh
 
 import (
 	"bytes"
-	"regexp"
+	"io"
+	"net/http"
+	"strings"
 	"testing"
 
-	"github.com/cli/cli/internal/config"
-	"github.com/cli/cli/pkg/cmdutil"
-	"github.com/cli/cli/pkg/httpmock"
-	"github.com/cli/cli/pkg/iostreams"
-	"github.com/cli/cli/pkg/prompt"
+	"github.com/cli/cli/v2/internal/config"
+	"github.com/cli/cli/v2/pkg/cmdutil"
+	"github.com/cli/cli/v2/pkg/httpmock"
+	"github.com/cli/cli/v2/pkg/iostreams"
+	"github.com/cli/cli/v2/pkg/prompt"
 	"github.com/google/shlex"
 	"github.com/stretchr/testify/assert"
 )
@@ -37,9 +39,11 @@ func Test_NewCmdRefresh(t *testing.T) {
 			wantsErr: true,
 		},
 		{
-			name:     "nontty hostname",
-			cli:      "-h aline.cedrac",
-			wantsErr: true,
+			name: "nontty hostname",
+			cli:  "-h aline.cedrac",
+			wants: RefreshOptions{
+				Hostname: "aline.cedrac",
+			},
 		},
 		{
 			name: "tty hostname",
@@ -85,13 +89,13 @@ func Test_NewCmdRefresh(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			io, _, _, _ := iostreams.Test()
+			ios, _, _, _ := iostreams.Test()
 			f := &cmdutil.Factory{
-				IOStreams: io,
+				IOStreams: ios,
 			}
-			io.SetStdinTTY(tt.tty)
-			io.SetStdoutTTY(tt.tty)
-			io.SetNeverPrompt(tt.neverPrompt)
+			ios.SetStdinTTY(tt.tty)
+			ios.SetStdoutTTY(tt.tty)
+			ios.SetNeverPrompt(tt.neverPrompt)
 
 			argv, err := shlex.Split(tt.cli)
 			assert.NoError(t, err)
@@ -132,14 +136,15 @@ func Test_refreshRun(t *testing.T) {
 		opts         *RefreshOptions
 		askStubs     func(*prompt.AskStubber)
 		cfgHosts     []string
-		wantErr      *regexp.Regexp
+		oldScopes    string
+		wantErr      string
 		nontty       bool
 		wantAuthArgs authArgs
 	}{
 		{
 			name:    "no hosts configured",
 			opts:    &RefreshOptions{},
-			wantErr: regexp.MustCompile(`not logged in to any hosts`),
+			wantErr: `not logged in to any hosts`,
 		},
 		{
 			name: "hostname given but dne",
@@ -150,7 +155,7 @@ func Test_refreshRun(t *testing.T) {
 			opts: &RefreshOptions{
 				Hostname: "obed.morton",
 			},
-			wantErr: regexp.MustCompile(`not logged in to obed.morton`),
+			wantErr: `not logged in to obed.morton`,
 		},
 		{
 			name: "hostname provided and is configured",
@@ -189,7 +194,7 @@ func Test_refreshRun(t *testing.T) {
 				Hostname: "",
 			},
 			askStubs: func(as *prompt.AskStubber) {
-				as.StubOne("github.com")
+				as.StubPrompt("What account do you want to refresh auth for?").AnswerWith("github.com")
 			},
 			wantAuthArgs: authArgs{
 				hostname: "github.com",
@@ -209,22 +214,36 @@ func Test_refreshRun(t *testing.T) {
 				scopes:   []string{"repo:invite", "public_key:read"},
 			},
 		},
+		{
+			name: "scopes provided",
+			cfgHosts: []string{
+				"github.com",
+			},
+			oldScopes: "delete_repo, codespace",
+			opts: &RefreshOptions{
+				Scopes: []string{"repo:invite", "public_key:read"},
+			},
+			wantAuthArgs: authArgs{
+				hostname: "github.com",
+				scopes:   []string{"repo:invite", "public_key:read", "delete_repo", "codespace"},
+			},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			aa := authArgs{}
-			tt.opts.AuthFlow = func(_ config.Config, hostname string, scopes []string) error {
+			tt.opts.AuthFlow = func(_ config.Config, _ *iostreams.IOStreams, hostname string, scopes []string, interactive bool) error {
 				aa.hostname = hostname
 				aa.scopes = scopes
 				return nil
 			}
 
-			io, _, _, _ := iostreams.Test()
+			ios, _, _, _ := iostreams.Test()
 
-			io.SetStdinTTY(!tt.nontty)
-			io.SetStdoutTTY(!tt.nontty)
+			ios.SetStdinTTY(!tt.nontty)
+			ios.SetStdoutTTY(!tt.nontty)
 
-			tt.opts.IO = io
+			tt.opts.IO = ios
 			cfg := config.NewBlankConfig()
 			tt.opts.Config = func() (config.Config, error) {
 				return cfg, nil
@@ -232,34 +251,47 @@ func Test_refreshRun(t *testing.T) {
 			for _, hostname := range tt.cfgHosts {
 				_ = cfg.Set(hostname, "oauth_token", "abc123")
 			}
-			reg := &httpmock.Registry{}
-			reg.Register(
-				httpmock.GraphQL(`query UserCurrent\b`),
-				httpmock.StringResponse(`{"data":{"viewer":{"login":"cybilb"}}}`))
+
+			httpReg := &httpmock.Registry{}
+			httpReg.Register(
+				httpmock.REST("GET", ""),
+				func(req *http.Request) (*http.Response, error) {
+					statusCode := 200
+					if req.Header.Get("Authorization") != "token abc123" {
+						statusCode = 400
+					}
+					return &http.Response{
+						Request:    req,
+						StatusCode: statusCode,
+						Body:       io.NopCloser(strings.NewReader(``)),
+						Header: http.Header{
+							"X-Oauth-Scopes": {tt.oldScopes},
+						},
+					}, nil
+				},
+			)
+			tt.opts.httpClient = &http.Client{Transport: httpReg}
 
 			mainBuf := bytes.Buffer{}
 			hostsBuf := bytes.Buffer{}
 			defer config.StubWriteConfig(&mainBuf, &hostsBuf)()
 
-			as, teardown := prompt.InitAskStubber()
-			defer teardown()
+			as := prompt.NewAskStubber(t)
 			if tt.askStubs != nil {
 				tt.askStubs(as)
 			}
 
 			err := refreshRun(tt.opts)
-			assert.Equal(t, tt.wantErr == nil, err == nil)
-			if err != nil {
-				if tt.wantErr != nil {
-					assert.True(t, tt.wantErr.MatchString(err.Error()))
-					return
-				} else {
-					t.Fatalf("unexpected error: %s", err)
+			if tt.wantErr != "" {
+				if assert.Error(t, err) {
+					assert.Contains(t, err.Error(), tt.wantErr)
 				}
+			} else {
+				assert.NoError(t, err)
 			}
 
-			assert.Equal(t, aa.hostname, tt.wantAuthArgs.hostname)
-			assert.Equal(t, aa.scopes, tt.wantAuthArgs.scopes)
+			assert.Equal(t, tt.wantAuthArgs.hostname, aa.hostname)
+			assert.Equal(t, tt.wantAuthArgs.scopes, aa.scopes)
 		})
 	}
 }

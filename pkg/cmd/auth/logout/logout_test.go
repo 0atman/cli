@@ -6,11 +6,11 @@ import (
 	"regexp"
 	"testing"
 
-	"github.com/cli/cli/internal/config"
-	"github.com/cli/cli/pkg/cmdutil"
-	"github.com/cli/cli/pkg/httpmock"
-	"github.com/cli/cli/pkg/iostreams"
-	"github.com/cli/cli/pkg/prompt"
+	"github.com/cli/cli/v2/internal/config"
+	"github.com/cli/cli/v2/pkg/cmdutil"
+	"github.com/cli/cli/v2/pkg/httpmock"
+	"github.com/cli/cli/v2/pkg/iostreams"
+	"github.com/cli/cli/v2/pkg/prompt"
 	"github.com/google/shlex"
 	"github.com/stretchr/testify/assert"
 )
@@ -54,12 +54,12 @@ func Test_NewCmdLogout(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			io, _, _, _ := iostreams.Test()
+			ios, _, _, _ := iostreams.Test()
 			f := &cmdutil.Factory{
-				IOStreams: io,
+				IOStreams: ios,
 			}
-			io.SetStdinTTY(tt.tty)
-			io.SetStdoutTTY(tt.tty)
+			ios.SetStdinTTY(tt.tty)
+			ios.SetStdoutTTY(tt.tty)
 
 			argv, err := shlex.Split(tt.cli)
 			assert.NoError(t, err)
@@ -98,7 +98,7 @@ func Test_logoutRun_tty(t *testing.T) {
 		cfgHosts   []string
 		wantHosts  string
 		wantErrOut *regexp.Regexp
-		wantErr    *regexp.Regexp
+		wantErr    string
 	}{
 		{
 			name:      "no arguments, multiple hosts",
@@ -106,8 +106,8 @@ func Test_logoutRun_tty(t *testing.T) {
 			cfgHosts:  []string{"cheryl.mason", "github.com"},
 			wantHosts: "cheryl.mason:\n    oauth_token: abc123\n",
 			askStubs: func(as *prompt.AskStubber) {
-				as.StubOne("github.com")
-				as.StubOne(true)
+				as.StubPrompt("What account do you want to log out of?").AnswerWith("github.com")
+				as.StubPrompt("Are you sure you want to log out of github.com account 'cybilb'?").AnswerWith(true)
 			},
 			wantErrOut: regexp.MustCompile(`Logged out of github.com account 'cybilb'`),
 		},
@@ -116,14 +116,14 @@ func Test_logoutRun_tty(t *testing.T) {
 			opts:     &LogoutOptions{},
 			cfgHosts: []string{"github.com"},
 			askStubs: func(as *prompt.AskStubber) {
-				as.StubOne(true)
+				as.StubPrompt("Are you sure you want to log out of github.com account 'cybilb'?").AnswerWith(true)
 			},
 			wantErrOut: regexp.MustCompile(`Logged out of github.com account 'cybilb'`),
 		},
 		{
 			name:    "no arguments, no hosts",
 			opts:    &LogoutOptions{},
-			wantErr: regexp.MustCompile(`not logged in to any hosts`),
+			wantErr: `not logged in to any hosts`,
 		},
 		{
 			name: "hostname",
@@ -133,7 +133,7 @@ func Test_logoutRun_tty(t *testing.T) {
 			cfgHosts:  []string{"cheryl.mason", "github.com"},
 			wantHosts: "github.com:\n    oauth_token: abc123\n",
 			askStubs: func(as *prompt.AskStubber) {
-				as.StubOne(true)
+				as.StubPrompt("Are you sure you want to log out of cheryl.mason account 'cybilb'?").AnswerWith(true)
 			},
 			wantErrOut: regexp.MustCompile(`Logged out of cheryl.mason account 'cybilb'`),
 		},
@@ -141,12 +141,12 @@ func Test_logoutRun_tty(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			io, _, _, stderr := iostreams.Test()
+			ios, _, _, stderr := iostreams.Test()
 
-			io.SetStdinTTY(true)
-			io.SetStdoutTTY(true)
+			ios.SetStdinTTY(true)
+			ios.SetStdoutTTY(true)
 
-			tt.opts.IO = io
+			tt.opts.IO = ios
 			cfg := config.NewBlankConfig()
 			tt.opts.Config = func() (config.Config, error) {
 				return cfg, nil
@@ -169,21 +169,17 @@ func Test_logoutRun_tty(t *testing.T) {
 			hostsBuf := bytes.Buffer{}
 			defer config.StubWriteConfig(&mainBuf, &hostsBuf)()
 
-			as, teardown := prompt.InitAskStubber()
-			defer teardown()
+			as := prompt.NewAskStubber(t)
 			if tt.askStubs != nil {
 				tt.askStubs(as)
 			}
 
 			err := logoutRun(tt.opts)
-			assert.Equal(t, tt.wantErr == nil, err == nil)
-			if err != nil {
-				if tt.wantErr != nil {
-					assert.True(t, tt.wantErr.MatchString(err.Error()))
-					return
-				} else {
-					t.Fatalf("unexpected error: %s", err)
-				}
+			if tt.wantErr != "" {
+				assert.EqualError(t, err, tt.wantErr)
+				return
+			} else {
+				assert.NoError(t, err)
 			}
 
 			if tt.wantErrOut == nil {
@@ -204,7 +200,7 @@ func Test_logoutRun_nontty(t *testing.T) {
 		opts      *LogoutOptions
 		cfgHosts  []string
 		wantHosts string
-		wantErr   *regexp.Regexp
+		wantErr   string
 		ghtoken   string
 	}{
 		{
@@ -227,18 +223,18 @@ func Test_logoutRun_nontty(t *testing.T) {
 			opts: &LogoutOptions{
 				Hostname: "harry.mason",
 			},
-			wantErr: regexp.MustCompile(`not logged in to any hosts`),
+			wantErr: `not logged in to any hosts`,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			io, _, _, stderr := iostreams.Test()
+			ios, _, _, stderr := iostreams.Test()
 
-			io.SetStdinTTY(false)
-			io.SetStdoutTTY(false)
+			ios.SetStdinTTY(false)
+			ios.SetStdoutTTY(false)
 
-			tt.opts.IO = io
+			tt.opts.IO = ios
 			cfg := config.NewBlankConfig()
 			tt.opts.Config = func() (config.Config, error) {
 				return cfg, nil
@@ -258,16 +254,10 @@ func Test_logoutRun_nontty(t *testing.T) {
 			defer config.StubWriteConfig(&mainBuf, &hostsBuf)()
 
 			err := logoutRun(tt.opts)
-			assert.Equal(t, tt.wantErr == nil, err == nil)
-			if err != nil {
-				if tt.wantErr != nil {
-					if !tt.wantErr.MatchString(err.Error()) {
-						t.Errorf("got error: %v", err)
-					}
-					return
-				} else {
-					t.Fatalf("unexpected error: %s", err)
-				}
+			if tt.wantErr != "" {
+				assert.EqualError(t, err, tt.wantErr)
+			} else {
+				assert.NoError(t, err)
 			}
 
 			assert.Equal(t, "", stderr.String())

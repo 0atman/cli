@@ -2,17 +2,19 @@ package gist
 
 import (
 	"github.com/MakeNowJust/heredoc"
-	gistCreateCmd "github.com/cli/cli/pkg/cmd/gist/create"
-	gistEditCmd "github.com/cli/cli/pkg/cmd/gist/edit"
-	gistListCmd "github.com/cli/cli/pkg/cmd/gist/list"
-	gistViewCmd "github.com/cli/cli/pkg/cmd/gist/view"
-	"github.com/cli/cli/pkg/cmdutil"
+	gistCloneCmd "github.com/cli/cli/v2/pkg/cmd/gist/clone"
+	gistCreateCmd "github.com/cli/cli/v2/pkg/cmd/gist/create"
+	gistDeleteCmd "github.com/cli/cli/v2/pkg/cmd/gist/delete"
+	gistEditCmd "github.com/cli/cli/v2/pkg/cmd/gist/edit"
+	gistListCmd "github.com/cli/cli/v2/pkg/cmd/gist/list"
+	gistViewCmd "github.com/cli/cli/v2/pkg/cmd/gist/view"
+	"github.com/cli/cli/v2/pkg/cmdutil"
 	"github.com/spf13/cobra"
 )
 
 func NewCmdGist(f *cmdutil.Factory) *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "gist",
+		Use:   "gist <command>",
 		Short: "Manage gists",
 		Long:  `Work with GitHub gists.`,
 		Annotations: map[string]string{
@@ -25,10 +27,12 @@ func NewCmdGist(f *cmdutil.Factory) *cobra.Command {
 		},
 	}
 
+	cmd.AddCommand(gistCloneCmd.NewCmdClone(f, nil))
 	cmd.AddCommand(gistCreateCmd.NewCmdCreate(f, nil))
 	cmd.AddCommand(gistListCmd.NewCmdList(f, nil))
 	cmd.AddCommand(gistViewCmd.NewCmdView(f, nil))
 	cmd.AddCommand(gistEditCmd.NewCmdEdit(f, nil))
+	cmd.AddCommand(gistDeleteCmd.NewCmdDelete(f, nil))
 
 	return cmd
 }

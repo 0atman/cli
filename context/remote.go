@@ -5,8 +5,8 @@ import (
 	"net/url"
 	"strings"
 
-	"github.com/cli/cli/git"
-	"github.com/cli/cli/internal/ghrepo"
+	"github.com/cli/cli/v2/git"
+	"github.com/cli/cli/v2/internal/ghrepo"
 )
 
 // Remotes represents a set of git remotes
@@ -52,6 +52,20 @@ func (r Remotes) Len() int      { return len(r) }
 func (r Remotes) Swap(i, j int) { r[i], r[j] = r[j], r[i] }
 func (r Remotes) Less(i, j int) bool {
 	return remoteNameSortScore(r[i].Name) > remoteNameSortScore(r[j].Name)
+}
+
+// Filter remotes by given hostnames, maintains original order
+func (r Remotes) FilterByHosts(hosts []string) Remotes {
+	filtered := make(Remotes, 0)
+	for _, rr := range r {
+		for _, host := range hosts {
+			if strings.EqualFold(rr.RepoHost(), host) {
+				filtered = append(filtered, rr)
+				break
+			}
+		}
+	}
+	return filtered
 }
 
 // Remote represents a git remote mapped to a GitHub repository

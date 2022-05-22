@@ -2,30 +2,38 @@ package review
 
 import (
 	"bytes"
-	"encoding/json"
-	"io/ioutil"
+	"fmt"
+	"io"
 	"net/http"
-	"regexp"
+	"os"
+	"path/filepath"
 	"testing"
 
-	"github.com/cli/cli/context"
-	"github.com/cli/cli/git"
-	"github.com/cli/cli/internal/config"
-	"github.com/cli/cli/internal/ghrepo"
-	"github.com/cli/cli/pkg/cmdutil"
-	"github.com/cli/cli/pkg/httpmock"
-	"github.com/cli/cli/pkg/iostreams"
-	"github.com/cli/cli/pkg/prompt"
-	"github.com/cli/cli/test"
+	"github.com/MakeNowJust/heredoc"
+	"github.com/cli/cli/v2/api"
+	"github.com/cli/cli/v2/context"
+	"github.com/cli/cli/v2/internal/config"
+	"github.com/cli/cli/v2/internal/ghrepo"
+	"github.com/cli/cli/v2/pkg/cmd/pr/shared"
+	"github.com/cli/cli/v2/pkg/cmdutil"
+	"github.com/cli/cli/v2/pkg/httpmock"
+	"github.com/cli/cli/v2/pkg/iostreams"
+	"github.com/cli/cli/v2/pkg/prompt"
+	"github.com/cli/cli/v2/test"
 	"github.com/google/shlex"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 func Test_NewCmdReview(t *testing.T) {
+	tmpFile := filepath.Join(t.TempDir(), "my-body.md")
+	err := os.WriteFile(tmpFile, []byte("a body from file"), 0600)
+	require.NoError(t, err)
+
 	tests := []struct {
 		name    string
 		args    string
+		stdin   string
 		isTTY   bool
 		want    ReviewOptions
 		wantErr string
@@ -48,6 +56,27 @@ func Test_NewCmdReview(t *testing.T) {
 				SelectorArg: "",
 				ReviewType:  0,
 				Body:        "",
+			},
+		},
+		{
+			name:  "body from stdin",
+			args:  "123 --request-changes --body-file -",
+			stdin: "this is on standard input",
+			isTTY: true,
+			want: ReviewOptions{
+				SelectorArg: "123",
+				ReviewType:  1,
+				Body:        "this is on standard input",
+			},
+		},
+		{
+			name:  "body from file",
+			args:  fmt.Sprintf("123 --request-changes --body-file '%s'", tmpFile),
+			isTTY: true,
+			want: ReviewOptions{
+				SelectorArg: "123",
+				ReviewType:  1,
+				Body:        "a body from file",
 			},
 		},
 		{
@@ -86,16 +115,26 @@ func Test_NewCmdReview(t *testing.T) {
 			isTTY:   true,
 			wantErr: "--body unsupported without --approve, --request-changes, or --comment",
 		},
+		{
+			name:    "body and body-file flags",
+			args:    "--body 'test' --body-file 'test-file.txt'",
+			isTTY:   true,
+			wantErr: "specify only one of `--body` or `--body-file`",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			io, _, _, _ := iostreams.Test()
-			io.SetStdoutTTY(tt.isTTY)
-			io.SetStdinTTY(tt.isTTY)
-			io.SetStderrTTY(tt.isTTY)
+			ios, stdin, _, _ := iostreams.Test()
+			ios.SetStdoutTTY(tt.isTTY)
+			ios.SetStdinTTY(tt.isTTY)
+			ios.SetStderrTTY(tt.isTTY)
+
+			if tt.stdin != "" {
+				_, _ = stdin.WriteString(tt.stdin)
+			}
 
 			f := &cmdutil.Factory{
-				IOStreams: io,
+				IOStreams: ios,
 			}
 
 			var opts *ReviewOptions
@@ -110,8 +149,8 @@ func Test_NewCmdReview(t *testing.T) {
 			cmd.SetArgs(argv)
 
 			cmd.SetIn(&bytes.Buffer{})
-			cmd.SetOut(ioutil.Discard)
-			cmd.SetErr(ioutil.Discard)
+			cmd.SetOut(io.Discard)
+			cmd.SetErr(io.Discard)
 
 			_, err = cmd.ExecuteC()
 			if tt.wantErr != "" {
@@ -128,36 +167,18 @@ func Test_NewCmdReview(t *testing.T) {
 }
 
 func runCommand(rt http.RoundTripper, remotes context.Remotes, isTTY bool, cli string) (*test.CmdOut, error) {
-	io, _, stdout, stderr := iostreams.Test()
-	io.SetStdoutTTY(isTTY)
-	io.SetStdinTTY(isTTY)
-	io.SetStderrTTY(isTTY)
+	ios, _, stdout, stderr := iostreams.Test()
+	ios.SetStdoutTTY(isTTY)
+	ios.SetStdinTTY(isTTY)
+	ios.SetStderrTTY(isTTY)
 
 	factory := &cmdutil.Factory{
-		IOStreams: io,
+		IOStreams: ios,
 		HttpClient: func() (*http.Client, error) {
 			return &http.Client{Transport: rt}, nil
 		},
 		Config: func() (config.Config, error) {
 			return config.NewBlankConfig(), nil
-		},
-		BaseRepo: func() (ghrepo.Interface, error) {
-			return ghrepo.New("OWNER", "REPO"), nil
-		},
-		Remotes: func() (context.Remotes, error) {
-			if remotes == nil {
-				return context.Remotes{
-					{
-						Remote: &git.Remote{Name: "origin"},
-						Repo:   ghrepo.New("OWNER", "REPO"),
-					},
-				}, nil
-			}
-
-			return remotes, nil
-		},
-		Branch: func() (string, error) {
-			return "feature", nil
 		},
 	}
 
@@ -170,8 +191,8 @@ func runCommand(rt http.RoundTripper, remotes context.Remotes, isTTY bool, cli s
 	cmd.SetArgs(argv)
 
 	cmd.SetIn(&bytes.Buffer{})
-	cmd.SetOut(ioutil.Discard)
-	cmd.SetErr(ioutil.Discard)
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
 
 	_, err = cmd.ExecuteC()
 	return &test.CmdOut{
@@ -180,249 +201,95 @@ func runCommand(rt http.RoundTripper, remotes context.Remotes, isTTY bool, cli s
 	}, err
 }
 
-func TestPRReview_url_arg(t *testing.T) {
-	http := &httpmock.Registry{}
-	defer http.Verify(t)
-	http.StubResponse(200, bytes.NewBufferString(`
-		{ "data": { "repository": { "pullRequest": {
-			"id": "foobar123",
-			"number": 123,
-			"headRefName": "feature",
-			"headRepositoryOwner": {
-				"login": "hubot"
-			},
-			"headRepository": {
-				"name": "REPO",
-				"defaultBranchRef": {
-					"name": "master"
-				}
-			},
-			"isCrossRepository": false,
-			"maintainerCanModify": false
-		} } } } `))
-	http.StubResponse(200, bytes.NewBufferString(`{"data": {} }`))
-
-	output, err := runCommand(http, nil, true, "--approve https://github.com/OWNER/REPO/pull/123")
-	if err != nil {
-		t.Fatalf("error running pr review: %s", err)
-	}
-
-	test.ExpectLines(t, output.Stderr(), "Approved pull request #123")
-
-	bodyBytes, _ := ioutil.ReadAll(http.Requests[1].Body)
-	reqBody := struct {
-		Variables struct {
-			Input struct {
-				PullRequestID string
-				Event         string
-				Body          string
-			}
-		}
-	}{}
-	_ = json.Unmarshal(bodyBytes, &reqBody)
-
-	assert.Equal(t, "foobar123", reqBody.Variables.Input.PullRequestID)
-	assert.Equal(t, "APPROVE", reqBody.Variables.Input.Event)
-	assert.Equal(t, "", reqBody.Variables.Input.Body)
-}
-
-func TestPRReview_number_arg(t *testing.T) {
-	http := &httpmock.Registry{}
-	defer http.Verify(t)
-	http.StubResponse(200, bytes.NewBufferString(`
-		{ "data": { "repository": { "pullRequest": {
-			"id": "foobar123",
-			"number": 123,
-			"headRefName": "feature",
-			"headRepositoryOwner": {
-				"login": "hubot"
-			},
-			"headRepository": {
-				"name": "REPO",
-				"defaultBranchRef": {
-					"name": "master"
-				}
-			},
-			"isCrossRepository": false,
-			"maintainerCanModify": false
-		} } } } `))
-	http.StubResponse(200, bytes.NewBufferString(`{"data": {} }`))
-
-	output, err := runCommand(http, nil, true, "--approve 123")
-	if err != nil {
-		t.Fatalf("error running pr review: %s", err)
-	}
-
-	test.ExpectLines(t, output.Stderr(), "Approved pull request #123")
-
-	bodyBytes, _ := ioutil.ReadAll(http.Requests[1].Body)
-	reqBody := struct {
-		Variables struct {
-			Input struct {
-				PullRequestID string
-				Event         string
-				Body          string
-			}
-		}
-	}{}
-	_ = json.Unmarshal(bodyBytes, &reqBody)
-
-	assert.Equal(t, "foobar123", reqBody.Variables.Input.PullRequestID)
-	assert.Equal(t, "APPROVE", reqBody.Variables.Input.Event)
-	assert.Equal(t, "", reqBody.Variables.Input.Body)
-}
-
-func TestPRReview_no_arg(t *testing.T) {
-	http := &httpmock.Registry{}
-	defer http.Verify(t)
-	http.StubResponse(200, bytes.NewBufferString(`
-		{ "data": { "repository": { "pullRequests": { "nodes": [
-			{ "url": "https://github.com/OWNER/REPO/pull/123",
-			  "number": 123,
-			  "id": "foobar123",
-			  "headRefName": "feature",
-				"baseRefName": "master" }
-		] } } } }`))
-	http.StubResponse(200, bytes.NewBufferString(`{"data": {} }`))
-
-	output, err := runCommand(http, nil, true, `--comment -b "cool story"`)
-	if err != nil {
-		t.Fatalf("error running pr review: %s", err)
-	}
-
-	test.ExpectLines(t, output.Stderr(), "Reviewed pull request #123")
-
-	bodyBytes, _ := ioutil.ReadAll(http.Requests[1].Body)
-	reqBody := struct {
-		Variables struct {
-			Input struct {
-				PullRequestID string
-				Event         string
-				Body          string
-			}
-		}
-	}{}
-	_ = json.Unmarshal(bodyBytes, &reqBody)
-
-	assert.Equal(t, "foobar123", reqBody.Variables.Input.PullRequestID)
-	assert.Equal(t, "COMMENT", reqBody.Variables.Input.Event)
-	assert.Equal(t, "cool story", reqBody.Variables.Input.Body)
-}
-
 func TestPRReview(t *testing.T) {
-	type c struct {
-		Cmd           string
-		ExpectedEvent string
-		ExpectedBody  string
-	}
-	cases := []c{
-		{`--request-changes -b"bad"`, "REQUEST_CHANGES", "bad"},
-		{`--approve`, "APPROVE", ""},
-		{`--approve -b"hot damn"`, "APPROVE", "hot damn"},
-		{`--comment --body "i donno"`, "COMMENT", "i donno"},
+	tests := []struct {
+		args      string
+		wantEvent string
+		wantBody  string
+	}{
+		{
+			args:      `--request-changes -b"bad"`,
+			wantEvent: "REQUEST_CHANGES",
+			wantBody:  "bad",
+		},
+		{
+			args:      `--approve`,
+			wantEvent: "APPROVE",
+			wantBody:  "",
+		},
+		{
+			args:      `--approve -b"hot damn"`,
+			wantEvent: "APPROVE",
+			wantBody:  "hot damn",
+		},
+		{
+			args:      `--comment --body "i dunno"`,
+			wantEvent: "COMMENT",
+			wantBody:  "i dunno",
+		},
 	}
 
-	for _, kase := range cases {
-		t.Run(kase.Cmd, func(t *testing.T) {
+	for _, tt := range tests {
+		t.Run(tt.args, func(t *testing.T) {
 			http := &httpmock.Registry{}
 			defer http.Verify(t)
-			http.StubResponse(200, bytes.NewBufferString(`
-				{ "data": { "repository": { "pullRequests": { "nodes": [
-					{ "url": "https://github.com/OWNER/REPO/pull/123",
-					"id": "foobar123",
-					"headRefName": "feature",
-						"baseRefName": "master" }
-				] } } } }
-			`))
-			http.StubResponse(200, bytes.NewBufferString(`{"data": {} }`))
 
-			_, err := runCommand(http, nil, false, kase.Cmd)
-			if err != nil {
-				t.Fatalf("got unexpected error running %s: %s", kase.Cmd, err)
-			}
+			shared.RunCommandFinder("", &api.PullRequest{ID: "THE-ID"}, ghrepo.New("OWNER", "REPO"))
 
-			bodyBytes, _ := ioutil.ReadAll(http.Requests[1].Body)
-			reqBody := struct {
-				Variables struct {
-					Input struct {
-						Event string
-						Body  string
-					}
-				}
-			}{}
-			_ = json.Unmarshal(bodyBytes, &reqBody)
+			http.Register(
+				httpmock.GraphQL(`mutation PullRequestReviewAdd\b`),
+				httpmock.GraphQLMutation(`{"data": {} }`,
+					func(inputs map[string]interface{}) {
+						assert.Equal(t, map[string]interface{}{
+							"pullRequestId": "THE-ID",
+							"event":         tt.wantEvent,
+							"body":          tt.wantBody,
+						}, inputs)
+					}),
+			)
 
-			assert.Equal(t, kase.ExpectedEvent, reqBody.Variables.Input.Event)
-			assert.Equal(t, kase.ExpectedBody, reqBody.Variables.Input.Body)
+			output, err := runCommand(http, nil, false, tt.args)
+			assert.NoError(t, err)
+			assert.Equal(t, "", output.String())
+			assert.Equal(t, "", output.Stderr())
 		})
 	}
-}
-
-func TestPRReview_nontty(t *testing.T) {
-	http := &httpmock.Registry{}
-	defer http.Verify(t)
-	http.StubResponse(200, bytes.NewBufferString(`
-		{ "data": { "repository": { "pullRequests": { "nodes": [
-			{ "url": "https://github.com/OWNER/REPO/pull/123",
-			  "number": 123,
-			  "id": "foobar123",
-			  "headRefName": "feature",
-				"baseRefName": "master" }
-		] } } } }
-	`))
-
-	http.StubResponse(200, bytes.NewBufferString(`{"data": {} }`))
-	output, err := runCommand(http, nil, false, "-c -bcool")
-	if err != nil {
-		t.Fatalf("unexpected error running command: %s", err)
-	}
-
-	assert.Equal(t, "", output.String())
-	assert.Equal(t, "", output.Stderr())
-
-	bodyBytes, _ := ioutil.ReadAll(http.Requests[1].Body)
-	reqBody := struct {
-		Variables struct {
-			Input struct {
-				Event string
-				Body  string
-			}
-		}
-	}{}
-	_ = json.Unmarshal(bodyBytes, &reqBody)
-
-	assert.Equal(t, "COMMENT", reqBody.Variables.Input.Event)
-	assert.Equal(t, "cool", reqBody.Variables.Input.Body)
 }
 
 func TestPRReview_interactive(t *testing.T) {
 	http := &httpmock.Registry{}
 	defer http.Verify(t)
-	http.StubResponse(200, bytes.NewBufferString(`
-		{ "data": { "repository": { "pullRequests": { "nodes": [
-			{ "url": "https://github.com/OWNER/REPO/pull/123",
-			  "number": 123,
-			  "id": "foobar123",
-			  "headRefName": "feature",
-				"baseRefName": "master" }
-		] } } } }
-	`))
-	http.StubResponse(200, bytes.NewBufferString(`{"data": {} }`))
+
+	shared.RunCommandFinder("", &api.PullRequest{ID: "THE-ID", Number: 123}, ghrepo.New("OWNER", "REPO"))
+
+	http.Register(
+		httpmock.GraphQL(`mutation PullRequestReviewAdd\b`),
+		httpmock.GraphQLMutation(`{"data": {} }`,
+			func(inputs map[string]interface{}) {
+				assert.Equal(t, inputs["event"], "APPROVE")
+				assert.Equal(t, inputs["body"], "cool story")
+			}),
+	)
+
+	//nolint:staticcheck // SA1019: prompt.InitAskStubber is deprecated: use NewAskStubber
 	as, teardown := prompt.InitAskStubber()
 	defer teardown()
 
+	//nolint:staticcheck // SA1019: as.Stub is deprecated: use StubPrompt
 	as.Stub([]*prompt.QuestionStub{
 		{
 			Name:  "reviewType",
 			Value: "Approve",
 		},
 	})
+	//nolint:staticcheck // SA1019: as.Stub is deprecated: use StubPrompt
 	as.Stub([]*prompt.QuestionStub{
 		{
 			Name:  "body",
 			Value: "cool story",
 		},
 	})
+	//nolint:staticcheck // SA1019: as.Stub is deprecated: use StubPrompt
 	as.Stub([]*prompt.QuestionStub{
 		{
 			Name:  "confirm",
@@ -431,100 +298,65 @@ func TestPRReview_interactive(t *testing.T) {
 	})
 
 	output, err := runCommand(http, nil, true, "")
-	if err != nil {
-		t.Fatalf("got unexpected error running pr review: %s", err)
-	}
+	assert.NoError(t, err)
+	assert.Equal(t, heredoc.Doc(`
+		Got:
 
-	test.ExpectLines(t, output.Stderr(), "Approved pull request #123")
-
-	test.ExpectLines(t, output.String(),
-		"Got:",
-		"cool.*story")
-
-	bodyBytes, _ := ioutil.ReadAll(http.Requests[1].Body)
-	reqBody := struct {
-		Variables struct {
-			Input struct {
-				Event string
-				Body  string
-			}
-		}
-	}{}
-	_ = json.Unmarshal(bodyBytes, &reqBody)
-
-	assert.Equal(t, "APPROVE", reqBody.Variables.Input.Event)
-	assert.Equal(t, "cool story", reqBody.Variables.Input.Body)
+		  cool story                                                                  
+		
+	`), output.String())
+	assert.Equal(t, "✓ Approved pull request #123\n", output.Stderr())
 }
 
 func TestPRReview_interactive_no_body(t *testing.T) {
 	http := &httpmock.Registry{}
 	defer http.Verify(t)
-	http.StubResponse(200, bytes.NewBufferString(`
-		{ "data": { "repository": { "pullRequests": { "nodes": [
-			{ "url": "https://github.com/OWNER/REPO/pull/123",
-			  "id": "foobar123",
-			  "headRefName": "feature",
-				"baseRefName": "master" }
-		] } } } }
-	`))
 
-	as, teardown := prompt.InitAskStubber()
-	defer teardown()
+	shared.RunCommandFinder("", &api.PullRequest{ID: "THE-ID", Number: 123}, ghrepo.New("OWNER", "REPO"))
 
-	as.Stub([]*prompt.QuestionStub{
-		{
-			Name:  "reviewType",
-			Value: "Request changes",
-		},
-	})
-	as.Stub([]*prompt.QuestionStub{
-		{
-			Name:    "body",
-			Default: true,
-		},
-	})
-	as.Stub([]*prompt.QuestionStub{
-		{
-			Name:  "confirm",
-			Value: true,
-		},
-	})
+	as := prompt.NewAskStubber(t)
+
+	as.StubPrompt("What kind of review do you want to give?").AnswerWith("Request changes")
+	as.StubPrompt("Review body").AnswerWith("")
 
 	_, err := runCommand(http, nil, true, "")
-	if err == nil {
-		t.Fatal("expected error")
-	}
-	assert.Equal(t, "this type of review cannot be blank", err.Error())
+	assert.EqualError(t, err, "this type of review cannot be blank")
 }
 
 func TestPRReview_interactive_blank_approve(t *testing.T) {
 	http := &httpmock.Registry{}
 	defer http.Verify(t)
-	http.StubResponse(200, bytes.NewBufferString(`
-		{ "data": { "repository": { "pullRequests": { "nodes": [
-			{ "url": "https://github.com/OWNER/REPO/pull/123",
-				"number": 123,
-			  "id": "foobar123",
-			  "headRefName": "feature",
-				"baseRefName": "master" }
-		] } } } }
-	`))
-	http.StubResponse(200, bytes.NewBufferString(`{"data": {} }`))
+
+	shared.RunCommandFinder("", &api.PullRequest{ID: "THE-ID", Number: 123}, ghrepo.New("OWNER", "REPO"))
+
+	http.Register(
+		httpmock.GraphQL(`mutation PullRequestReviewAdd\b`),
+		httpmock.GraphQLMutation(`{"data": {} }`,
+			func(inputs map[string]interface{}) {
+				assert.Equal(t, inputs["event"], "APPROVE")
+				assert.Equal(t, inputs["body"], "")
+			}),
+	)
+
+	//nolint:staticcheck // SA1019: prompt.InitAskStubber is deprecated: use NewAskStubber
 	as, teardown := prompt.InitAskStubber()
 	defer teardown()
 
+	//nolint:staticcheck // SA1019: as.Stub is deprecated: use StubPrompt
 	as.Stub([]*prompt.QuestionStub{
 		{
 			Name:  "reviewType",
 			Value: "Approve",
 		},
 	})
+	//nolint:staticcheck // SA1019: as.Stub is deprecated: use StubPrompt
 	as.Stub([]*prompt.QuestionStub{
 		{
 			Name:    "body",
 			Default: true,
 		},
 	})
+	//nolint:staticcheck // SA1019: as.Stub is deprecated: use StubPrompt
 	as.Stub([]*prompt.QuestionStub{
 		{
 			Name:  "confirm",
@@ -533,28 +365,7 @@ func TestPRReview_interactive_blank_approve(t *testing.T) {
 	})
 
 	output, err := runCommand(http, nil, true, "")
-	if err != nil {
-		t.Fatalf("got unexpected error running pr review: %s", err)
-	}
-
-	unexpect := regexp.MustCompile("Got:")
-	if unexpect.MatchString(output.String()) {
-		t.Errorf("did not expect to see body printed in %s", output.String())
-	}
-
-	test.ExpectLines(t, output.Stderr(), "Approved pull request #123")
-
-	bodyBytes, _ := ioutil.ReadAll(http.Requests[1].Body)
-	reqBody := struct {
-		Variables struct {
-			Input struct {
-				Event string
-				Body  string
-			}
-		}
-	}{}
-	_ = json.Unmarshal(bodyBytes, &reqBody)
-
-	assert.Equal(t, "APPROVE", reqBody.Variables.Input.Event)
-	assert.Equal(t, "", reqBody.Variables.Input.Body)
+	assert.NoError(t, err)
+	assert.Equal(t, "", output.String())
+	assert.Equal(t, "✓ Approved pull request #123\n", output.Stderr())
 }

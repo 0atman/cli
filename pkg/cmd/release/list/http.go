@@ -5,23 +5,24 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/cli/cli/internal/ghinstance"
-	"github.com/cli/cli/internal/ghrepo"
+	"github.com/cli/cli/v2/internal/ghinstance"
+	"github.com/cli/cli/v2/internal/ghrepo"
+	graphql "github.com/cli/shurcooL-graphql"
 	"github.com/shurcooL/githubv4"
-	"github.com/shurcooL/graphql"
 )
 
 type Release struct {
 	Name         string
 	TagName      string
 	IsDraft      bool
+	IsLatest     bool
 	IsPrerelease bool
 	CreatedAt    time.Time
 	PublishedAt  time.Time
 }
 
-func fetchReleases(httpClient *http.Client, repo ghrepo.Interface, limit int) ([]Release, error) {
-	var query struct {
+func fetchReleases(httpClient *http.Client, repo ghrepo.Interface, limit int, excludeDrafts bool) ([]Release, error) {
+	type responseData struct {
 		Repository struct {
 			Releases struct {
 				Nodes    []Release
@@ -50,12 +51,16 @@ func fetchReleases(httpClient *http.Client, repo ghrepo.Interface, limit int) ([
 	var releases []Release
 loop:
 	for {
+		var query responseData
 		err := gql.QueryNamed(context.Background(), "RepositoryReleaseList", &query, variables)
 		if err != nil {
 			return nil, err
 		}
 
 		for _, r := range query.Repository.Releases.Nodes {
+			if excludeDrafts && r.IsDraft {
+				continue
+			}
 			releases = append(releases, r)
 			if len(releases) == limit {
 				break loop

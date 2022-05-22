@@ -6,11 +6,11 @@ import (
 	"net/http"
 
 	"github.com/MakeNowJust/heredoc"
-	"github.com/cli/cli/api"
-	"github.com/cli/cli/internal/config"
-	"github.com/cli/cli/pkg/cmdutil"
-	"github.com/cli/cli/pkg/iostreams"
-	"github.com/cli/cli/utils"
+	"github.com/cli/cli/v2/api"
+	"github.com/cli/cli/v2/internal/config"
+	"github.com/cli/cli/v2/pkg/cmd/auth/shared"
+	"github.com/cli/cli/v2/pkg/cmdutil"
+	"github.com/cli/cli/v2/pkg/iostreams"
 	"github.com/spf13/cobra"
 )
 
@@ -19,7 +19,8 @@ type StatusOptions struct {
 	IO         *iostreams.IOStreams
 	Config     func() (config.Config, error)
 
-	Hostname string
+	Hostname  string
+	ShowToken bool
 }
 
 func NewCmdStatus(f *cmdutil.Factory, runF func(*StatusOptions) error) *cobra.Command {
@@ -34,7 +35,7 @@ func NewCmdStatus(f *cmdutil.Factory, runF func(*StatusOptions) error) *cobra.Co
 		Args:  cobra.ExactArgs(0),
 		Short: "View authentication status",
 		Long: heredoc.Doc(`Verifies and displays information about your authentication state.
-			
+
 			This command will test your authentication state for each GitHub host that gh knows about and
 			report on any issues.
 		`),
@@ -48,6 +49,7 @@ func NewCmdStatus(f *cmdutil.Factory, runF func(*StatusOptions) error) *cobra.Co
 	}
 
 	cmd.Flags().StringVarP(&opts.Hostname, "hostname", "h", "", "Check a specific hostname's auth status")
+	cmd.Flags().BoolVarP(&opts.ShowToken, "show-token", "t", false, "Display the auth token")
 
 	return cmd
 }
@@ -62,12 +64,17 @@ func statusRun(opts *StatusOptions) error {
 
 	stderr := opts.IO.ErrOut
 
+	cs := opts.IO.ColorScheme()
+
 	statusInfo := map[string][]string{}
 
 	hostnames, err := cfg.Hosts()
-	if len(hostnames) == 0 || err != nil {
+	if err != nil {
+		return err
+	}
+	if len(hostnames) == 0 {
 		fmt.Fprintf(stderr,
-			"You are not logged into any GitHub hosts. Run %s to authenticate.\n", utils.Bold("gh auth login"))
+			"You are not logged into any GitHub hosts. Run %s to authenticate.\n", cs.Bold("gh auth login"))
 		return cmdutil.SilentError
 	}
 
@@ -75,16 +82,17 @@ func statusRun(opts *StatusOptions) error {
 	if err != nil {
 		return err
 	}
-	apiClient := api.NewClientFromHTTP(httpClient)
 
 	var failed bool
+	var isHostnameFound bool
 
 	for _, hostname := range hostnames {
 		if opts.Hostname != "" && opts.Hostname != hostname {
 			continue
 		}
+		isHostnameFound = true
 
-		_, tokenSource, _ := cfg.GetWithSource(hostname, "oauth_token")
+		token, tokenSource, _ := cfg.GetWithSource(hostname, "oauth_token")
 		tokenIsWriteable := cfg.CheckWriteable(hostname, "oauth_token") == nil
 
 		statusInfo[hostname] = []string{}
@@ -92,38 +100,43 @@ func statusRun(opts *StatusOptions) error {
 			statusInfo[hostname] = append(statusInfo[hostname], fmt.Sprintf(x, ys...))
 		}
 
-		err = apiClient.HasMinimumScopes(hostname)
-		if err != nil {
-			var missingScopes *api.MissingScopesError
+		if err := shared.HasMinimumScopes(httpClient, hostname, token); err != nil {
+			var missingScopes *shared.MissingScopesError
 			if errors.As(err, &missingScopes) {
-				addMsg("%s %s: %s", utils.Red("X"), hostname, err)
+				addMsg("%s %s: the token in %s is %s", cs.Red("X"), hostname, tokenSource, err)
 				if tokenIsWriteable {
 					addMsg("- To request missing scopes, run: %s %s\n",
-						utils.Bold("gh auth refresh -h"),
-						utils.Bold(hostname))
+						cs.Bold("gh auth refresh -h"),
+						cs.Bold(hostname))
 				}
 			} else {
-				addMsg("%s %s: authentication failed", utils.Red("X"), hostname)
-				addMsg("- The %s token in %s is no longer valid.", utils.Bold(hostname), tokenSource)
+				addMsg("%s %s: authentication failed", cs.Red("X"), hostname)
+				addMsg("- The %s token in %s is no longer valid.", cs.Bold(hostname), tokenSource)
 				if tokenIsWriteable {
 					addMsg("- To re-authenticate, run: %s %s",
-						utils.Bold("gh auth login -h"), utils.Bold(hostname))
+						cs.Bold("gh auth login -h"), cs.Bold(hostname))
 					addMsg("- To forget about this host, run: %s %s",
-						utils.Bold("gh auth logout -h"), utils.Bold(hostname))
+						cs.Bold("gh auth logout -h"), cs.Bold(hostname))
 				}
 			}
 			failed = true
 		} else {
+			apiClient := api.NewClientFromHTTP(httpClient)
 			username, err := api.CurrentLoginName(apiClient, hostname)
 			if err != nil {
-				addMsg("%s %s: api call failed: %s", utils.Red("X"), hostname, err)
+				addMsg("%s %s: api call failed: %s", cs.Red("X"), hostname, err)
 			}
-			addMsg("%s Logged in to %s as %s (%s)", utils.GreenCheck(), hostname, utils.Bold(username), tokenSource)
-			proto, _ := cfg.Get(hostname, "git_protocol")
+			addMsg("%s Logged in to %s as %s (%s)", cs.SuccessIcon(), hostname, cs.Bold(username), tokenSource)
+			proto, _ := cfg.GetOrDefault(hostname, "git_protocol")
 			if proto != "" {
 				addMsg("%s Git operations for %s configured to use %s protocol.",
-					utils.GreenCheck(), hostname, utils.Bold(proto))
+					cs.SuccessIcon(), hostname, cs.Bold(proto))
 			}
+			tokenDisplay := "*******************"
+			if opts.ShowToken {
+				tokenDisplay = token
+			}
+			addMsg("%s Token: %s", cs.SuccessIcon(), tokenDisplay)
 		}
 		addMsg("")
 
@@ -131,12 +144,18 @@ func statusRun(opts *StatusOptions) error {
 		// not to since I wanted this command to be read-only.
 	}
 
+	if !isHostnameFound {
+		fmt.Fprintf(stderr,
+			"Hostname %q not found among authenticated GitHub hosts\n", opts.Hostname)
+		return cmdutil.SilentError
+	}
+
 	for _, hostname := range hostnames {
 		lines, ok := statusInfo[hostname]
 		if !ok {
 			continue
 		}
-		fmt.Fprintf(stderr, "%s\n", utils.Bold(hostname))
+		fmt.Fprintf(stderr, "%s\n", cs.Bold(hostname))
 		for _, line := range lines {
 			fmt.Fprintf(stderr, "  %s\n", line)
 		}

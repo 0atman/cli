@@ -2,16 +2,16 @@ package alias
 
 import (
 	"github.com/MakeNowJust/heredoc"
-	deleteCmd "github.com/cli/cli/pkg/cmd/alias/delete"
-	listCmd "github.com/cli/cli/pkg/cmd/alias/list"
-	setCmd "github.com/cli/cli/pkg/cmd/alias/set"
-	"github.com/cli/cli/pkg/cmdutil"
+	deleteCmd "github.com/cli/cli/v2/pkg/cmd/alias/delete"
+	listCmd "github.com/cli/cli/v2/pkg/cmd/alias/list"
+	setCmd "github.com/cli/cli/v2/pkg/cmd/alias/set"
+	"github.com/cli/cli/v2/pkg/cmdutil"
 	"github.com/spf13/cobra"
 )
 
 func NewCmdAlias(f *cmdutil.Factory) *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "alias",
+		Use:   "alias <command>",
 		Short: "Create command shortcuts",
 		Long: heredoc.Doc(`
 			Aliases can be used to make shortcuts for gh commands or to compose multiple commands.

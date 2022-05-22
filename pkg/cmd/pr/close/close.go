@@ -4,25 +4,24 @@ import (
 	"fmt"
 	"net/http"
 
-	"github.com/cli/cli/api"
-	"github.com/cli/cli/git"
-	"github.com/cli/cli/internal/config"
-	"github.com/cli/cli/internal/ghrepo"
-	"github.com/cli/cli/pkg/cmd/pr/shared"
-	"github.com/cli/cli/pkg/cmdutil"
-	"github.com/cli/cli/pkg/iostreams"
-	"github.com/cli/cli/utils"
+	"github.com/cli/cli/v2/api"
+	"github.com/cli/cli/v2/git"
+	"github.com/cli/cli/v2/internal/ghrepo"
+	"github.com/cli/cli/v2/pkg/cmd/pr/shared"
+	"github.com/cli/cli/v2/pkg/cmdutil"
+	"github.com/cli/cli/v2/pkg/iostreams"
 	"github.com/spf13/cobra"
 )
 
 type CloseOptions struct {
 	HttpClient func() (*http.Client, error)
-	Config     func() (config.Config, error)
 	IO         *iostreams.IOStreams
-	BaseRepo   func() (ghrepo.Interface, error)
 	Branch     func() (string, error)
 
+	Finder shared.PRFinder
+
 	SelectorArg       string
+	Comment           string
 	DeleteBranch      bool
 	DeleteLocalBranch bool
 }
@@ -31,7 +30,6 @@ func NewCmdClose(f *cmdutil.Factory, runF func(*CloseOptions) error) *cobra.Comm
 	opts := &CloseOptions{
 		IO:         f.IOStreams,
 		HttpClient: f.HttpClient,
-		Config:     f.Config,
 		Branch:     f.Branch,
 	}
 
@@ -40,8 +38,7 @@ func NewCmdClose(f *cmdutil.Factory, runF func(*CloseOptions) error) *cobra.Comm
 		Short: "Close a pull request",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			// support `-R, --repo` override
-			opts.BaseRepo = f.BaseRepo
+			opts.Finder = shared.NewFinder(f)
 
 			if len(args) > 0 {
 				opts.SelectorArg = args[0]
@@ -55,83 +52,108 @@ func NewCmdClose(f *cmdutil.Factory, runF func(*CloseOptions) error) *cobra.Comm
 			return closeRun(opts)
 		},
 	}
+
+	cmd.Flags().StringVarP(&opts.Comment, "comment", "c", "", "Leave a closing comment")
 	cmd.Flags().BoolVarP(&opts.DeleteBranch, "delete-branch", "d", false, "Delete the local and remote branch after close")
 
 	return cmd
 }
 
 func closeRun(opts *CloseOptions) error {
-	httpClient, err := opts.HttpClient()
-	if err != nil {
-		return err
-	}
-	apiClient := api.NewClientFromHTTP(httpClient)
+	cs := opts.IO.ColorScheme()
 
-	pr, baseRepo, err := shared.PRFromArgs(apiClient, opts.BaseRepo, nil, nil, opts.SelectorArg)
+	findOptions := shared.FindOptions{
+		Selector: opts.SelectorArg,
+		Fields:   []string{"state", "number", "title", "isCrossRepository", "headRefName"},
+	}
+	pr, baseRepo, err := opts.Finder.Find(findOptions)
 	if err != nil {
 		return err
 	}
 
 	if pr.State == "MERGED" {
-		fmt.Fprintf(opts.IO.ErrOut, "%s Pull request #%d (%s) can't be closed because it was already merged", utils.Red("!"), pr.Number, pr.Title)
+		fmt.Fprintf(opts.IO.ErrOut, "%s Pull request #%d (%s) can't be closed because it was already merged\n", cs.FailureIcon(), pr.Number, pr.Title)
 		return cmdutil.SilentError
-	} else if pr.Closed {
-		fmt.Fprintf(opts.IO.ErrOut, "%s Pull request #%d (%s) is already closed\n", utils.Yellow("!"), pr.Number, pr.Title)
+	} else if !pr.IsOpen() {
+		fmt.Fprintf(opts.IO.ErrOut, "%s Pull request #%d (%s) is already closed\n", cs.WarningIcon(), pr.Number, pr.Title)
 		return nil
 	}
 
-	err = api.PullRequestClose(apiClient, baseRepo, pr)
+	httpClient, err := opts.HttpClient()
+	if err != nil {
+		return err
+	}
+
+	if opts.Comment != "" {
+		commentOpts := &shared.CommentableOptions{
+			Body:       opts.Comment,
+			HttpClient: opts.HttpClient,
+			InputType:  shared.InputTypeInline,
+			Quiet:      true,
+			RetrieveCommentable: func() (shared.Commentable, ghrepo.Interface, error) {
+				return pr, baseRepo, nil
+			},
+		}
+		err := shared.CommentableRun(commentOpts)
+		if err != nil {
+			return err
+		}
+	}
+
+	err = api.PullRequestClose(httpClient, baseRepo, pr.ID)
 	if err != nil {
 		return fmt.Errorf("API call failed: %w", err)
 	}
 
-	fmt.Fprintf(opts.IO.ErrOut, "%s Closed pull request #%d (%s)\n", utils.Red("✔"), pr.Number, pr.Title)
-
-	crossRepoPR := pr.HeadRepositoryOwner.Login != baseRepo.RepoOwner()
+	fmt.Fprintf(opts.IO.ErrOut, "%s Closed pull request #%d (%s)\n", cs.SuccessIconWithColor(cs.Red), pr.Number, pr.Title)
 
 	if opts.DeleteBranch {
 		branchSwitchString := ""
+		apiClient := api.NewClientFromHTTP(httpClient)
+		localBranchExists := git.HasLocalBranch(pr.HeadRefName)
 
-		if opts.DeleteLocalBranch && !crossRepoPR {
-			currentBranch, err := opts.Branch()
-			if err != nil {
-				return err
-			}
-
-			var branchToSwitchTo string
-			if currentBranch == pr.HeadRefName {
-				branchToSwitchTo, err = api.RepoDefaultBranch(apiClient, baseRepo)
-				if err != nil {
-					return err
-				}
-				err = git.CheckoutBranch(branchToSwitchTo)
-				if err != nil {
-					return err
-				}
-			}
-
-			localBranchExists := git.HasLocalBranch(pr.HeadRefName)
+		if opts.DeleteLocalBranch {
 			if localBranchExists {
-				err = git.DeleteLocalBranch(pr.HeadRefName)
+				currentBranch, err := opts.Branch()
 				if err != nil {
-					err = fmt.Errorf("failed to delete local branch %s: %w", utils.Cyan(pr.HeadRefName), err)
 					return err
 				}
-			}
 
-			if branchToSwitchTo != "" {
-				branchSwitchString = fmt.Sprintf(" and switched to branch %s", utils.Cyan(branchToSwitchTo))
+				var branchToSwitchTo string
+				if currentBranch == pr.HeadRefName {
+					branchToSwitchTo, err = api.RepoDefaultBranch(apiClient, baseRepo)
+					if err != nil {
+						return err
+					}
+					err = git.CheckoutBranch(branchToSwitchTo)
+					if err != nil {
+						return err
+					}
+				}
+
+				if err := git.DeleteLocalBranch(pr.HeadRefName); err != nil {
+					return fmt.Errorf("failed to delete local branch %s: %w", cs.Cyan(pr.HeadRefName), err)
+				}
+
+				if branchToSwitchTo != "" {
+					branchSwitchString = fmt.Sprintf(" and switched to branch %s", cs.Cyan(branchToSwitchTo))
+				}
+			} else {
+				fmt.Fprintf(opts.IO.ErrOut, "%s Skipped deleting the local branch since current directory is not a git repository \n", cs.WarningIcon())
 			}
 		}
 
-		if !crossRepoPR {
-			err = api.BranchDeleteRemote(apiClient, baseRepo, pr.HeadRefName)
-			if err != nil {
-				err = fmt.Errorf("failed to delete remote branch %s: %w", utils.Cyan(pr.HeadRefName), err)
-				return err
+		if pr.IsCrossRepository {
+			fmt.Fprintf(opts.IO.ErrOut, "%s Skipped deleting the remote branch of a pull request from fork\n", cs.WarningIcon())
+			if !opts.DeleteLocalBranch {
+				return nil
+			}
+		} else {
+			if err := api.BranchDeleteRemote(apiClient, baseRepo, pr.HeadRefName); err != nil {
+				return fmt.Errorf("failed to delete remote branch %s: %w", cs.Cyan(pr.HeadRefName), err)
 			}
 		}
-		fmt.Fprintf(opts.IO.ErrOut, "%s Deleted branch %s%s\n", utils.Red("✔"), utils.Cyan(pr.HeadRefName), branchSwitchString)
+		fmt.Fprintf(opts.IO.ErrOut, "%s Deleted branch %s%s\n", cs.SuccessIconWithColor(cs.Red), cs.Cyan(pr.HeadRefName), branchSwitchString)
 	}
 
 	return nil

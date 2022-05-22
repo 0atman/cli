@@ -2,19 +2,21 @@ package pr
 
 import (
 	"github.com/MakeNowJust/heredoc"
-	cmdCheckout "github.com/cli/cli/pkg/cmd/pr/checkout"
-	cmdChecks "github.com/cli/cli/pkg/cmd/pr/checks"
-	cmdClose "github.com/cli/cli/pkg/cmd/pr/close"
-	cmdCreate "github.com/cli/cli/pkg/cmd/pr/create"
-	cmdDiff "github.com/cli/cli/pkg/cmd/pr/diff"
-	cmdList "github.com/cli/cli/pkg/cmd/pr/list"
-	cmdMerge "github.com/cli/cli/pkg/cmd/pr/merge"
-	cmdReady "github.com/cli/cli/pkg/cmd/pr/ready"
-	cmdReopen "github.com/cli/cli/pkg/cmd/pr/reopen"
-	cmdReview "github.com/cli/cli/pkg/cmd/pr/review"
-	cmdStatus "github.com/cli/cli/pkg/cmd/pr/status"
-	cmdView "github.com/cli/cli/pkg/cmd/pr/view"
-	"github.com/cli/cli/pkg/cmdutil"
+	cmdCheckout "github.com/cli/cli/v2/pkg/cmd/pr/checkout"
+	cmdChecks "github.com/cli/cli/v2/pkg/cmd/pr/checks"
+	cmdClose "github.com/cli/cli/v2/pkg/cmd/pr/close"
+	cmdComment "github.com/cli/cli/v2/pkg/cmd/pr/comment"
+	cmdCreate "github.com/cli/cli/v2/pkg/cmd/pr/create"
+	cmdDiff "github.com/cli/cli/v2/pkg/cmd/pr/diff"
+	cmdEdit "github.com/cli/cli/v2/pkg/cmd/pr/edit"
+	cmdList "github.com/cli/cli/v2/pkg/cmd/pr/list"
+	cmdMerge "github.com/cli/cli/v2/pkg/cmd/pr/merge"
+	cmdReady "github.com/cli/cli/v2/pkg/cmd/pr/ready"
+	cmdReopen "github.com/cli/cli/v2/pkg/cmd/pr/reopen"
+	cmdReview "github.com/cli/cli/v2/pkg/cmd/pr/review"
+	cmdStatus "github.com/cli/cli/v2/pkg/cmd/pr/status"
+	cmdView "github.com/cli/cli/v2/pkg/cmd/pr/view"
+	"github.com/cli/cli/v2/pkg/cmdutil"
 	"github.com/spf13/cobra"
 )
 
@@ -22,7 +24,7 @@ func NewCmdPR(f *cmdutil.Factory) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "pr <command>",
 		Short: "Manage pull requests",
-		Long:  "Work with GitHub pull requests",
+		Long:  "Work with GitHub pull requests.",
 		Example: heredoc.Doc(`
 			$ gh pr checkout 353
 			$ gh pr create --fill
@@ -53,6 +55,8 @@ func NewCmdPR(f *cmdutil.Factory) *cobra.Command {
 	cmd.AddCommand(cmdStatus.NewCmdStatus(f, nil))
 	cmd.AddCommand(cmdView.NewCmdView(f, nil))
 	cmd.AddCommand(cmdChecks.NewCmdChecks(f, nil))
+	cmd.AddCommand(cmdComment.NewCmdComment(f, nil))
+	cmd.AddCommand(cmdEdit.NewCmdEdit(f, nil))
 
 	return cmd
 }

@@ -6,11 +6,11 @@ import (
 	"sort"
 
 	"github.com/AlecAivazis/survey/v2"
-	"github.com/cli/cli/api"
-	"github.com/cli/cli/git"
-	"github.com/cli/cli/internal/ghrepo"
-	"github.com/cli/cli/pkg/iostreams"
-	"github.com/cli/cli/pkg/prompt"
+	"github.com/cli/cli/v2/api"
+	"github.com/cli/cli/v2/git"
+	"github.com/cli/cli/v2/internal/ghrepo"
+	"github.com/cli/cli/v2/pkg/iostreams"
+	"github.com/cli/cli/v2/pkg/prompt"
 )
 
 // cap the number of git remotes looked up, since the user might have an
@@ -104,7 +104,7 @@ func (r *ResolvedRemotes) BaseRepo(io *iostreams.IOStreams) (ghrepo.Interface, e
 		if repo == nil {
 			continue
 		}
-		if repo.IsFork() {
+		if repo.Parent != nil {
 			add(repo.Parent)
 		}
 		add(repo)
@@ -116,6 +116,9 @@ func (r *ResolvedRemotes) BaseRepo(io *iostreams.IOStreams) (ghrepo.Interface, e
 
 	baseName := repoNames[0]
 	if len(repoNames) > 1 {
+		// hide the spinner in case a command started the progress indicator before base repo was fully
+		// resolved, e.g. in `gh issue view`
+		io.StopProgressIndicator()
 		err := prompt.SurveyAskOne(&survey.Select{
 			Message: "Which should be the base repository (used for e.g. querying issues) for this directory?",
 			Options: repoNames,

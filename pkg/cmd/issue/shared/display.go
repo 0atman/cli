@@ -6,14 +6,15 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cli/cli/api"
-	prShared "github.com/cli/cli/pkg/cmd/pr/shared"
-	"github.com/cli/cli/pkg/iostreams"
-	"github.com/cli/cli/pkg/text"
-	"github.com/cli/cli/utils"
+	"github.com/cli/cli/v2/api"
+	prShared "github.com/cli/cli/v2/pkg/cmd/pr/shared"
+	"github.com/cli/cli/v2/pkg/iostreams"
+	"github.com/cli/cli/v2/pkg/text"
+	"github.com/cli/cli/v2/utils"
 )
 
 func PrintIssues(io *iostreams.IOStreams, prefix string, totalCount int, issues []api.Issue) {
+	cs := io.ColorScheme()
 	table := utils.NewTablePrinter(io)
 	for _, issue := range issues {
 		issueNum := strconv.Itoa(issue.Number)
@@ -21,20 +22,16 @@ func PrintIssues(io *iostreams.IOStreams, prefix string, totalCount int, issues 
 			issueNum = "#" + issueNum
 		}
 		issueNum = prefix + issueNum
-		labels := IssueLabelList(issue)
-		if labels != "" && table.IsTTY() {
-			labels = fmt.Sprintf("(%s)", labels)
-		}
 		now := time.Now()
 		ago := now.Sub(issue.UpdatedAt)
-		table.AddField(issueNum, nil, prShared.ColorFuncForState(issue.State))
+		table.AddField(issueNum, nil, cs.ColorFromString(prShared.ColorForIssueState(issue)))
 		if !table.IsTTY() {
 			table.AddField(issue.State, nil, nil)
 		}
 		table.AddField(text.ReplaceExcessiveWhitespace(issue.Title), nil, nil)
-		table.AddField(labels, nil, utils.Gray)
+		table.AddField(issueLabelList(&issue, cs, table.IsTTY()), nil, nil)
 		if table.IsTTY() {
-			table.AddField(utils.FuzzyAgo(ago), nil, utils.Gray)
+			table.AddField(utils.FuzzyAgo(ago), nil, cs.Gray)
 		} else {
 			table.AddField(issue.UpdatedAt.String(), nil, nil)
 		}
@@ -43,23 +40,23 @@ func PrintIssues(io *iostreams.IOStreams, prefix string, totalCount int, issues 
 	_ = table.Render()
 	remaining := totalCount - len(issues)
 	if remaining > 0 {
-		fmt.Fprintf(io.Out, utils.Gray("%sAnd %d more\n"), prefix, remaining)
+		fmt.Fprintf(io.Out, cs.Gray("%sAnd %d more\n"), prefix, remaining)
 	}
 }
 
-func IssueLabelList(issue api.Issue) string {
+func issueLabelList(issue *api.Issue, cs *iostreams.ColorScheme, colorize bool) string {
 	if len(issue.Labels.Nodes) == 0 {
 		return ""
 	}
 
 	labelNames := make([]string, 0, len(issue.Labels.Nodes))
 	for _, label := range issue.Labels.Nodes {
-		labelNames = append(labelNames, label.Name)
+		if colorize {
+			labelNames = append(labelNames, cs.HexToRGB(label.Color, label.Name))
+		} else {
+			labelNames = append(labelNames, label.Name)
+		}
 	}
 
-	list := strings.Join(labelNames, ", ")
-	if issue.Labels.TotalCount > len(issue.Labels.Nodes) {
-		list += ", …"
-	}
-	return list
+	return strings.Join(labelNames, ", ")
 }
