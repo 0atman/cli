@@ -3,19 +3,18 @@ package context
 
 import (
 	"errors"
+	"fmt"
+	"slices"
 	"sort"
 
-	"github.com/AlecAivazis/survey/v2"
-	"github.com/cli/cli/api"
-	"github.com/cli/cli/git"
-	"github.com/cli/cli/internal/ghrepo"
-	"github.com/cli/cli/pkg/iostreams"
-	"github.com/cli/cli/pkg/prompt"
+	"github.com/cli/cli/v2/api"
+	"github.com/cli/cli/v2/internal/ghrepo"
+	"github.com/cli/cli/v2/pkg/iostreams"
 )
 
-// cap the number of git remotes looked up, since the user might have an
-// unusually large number of git remotes
-const maxRemotesForLookup = 5
+// Cap the number of git remotes to look up, since the user might have an
+// unusually large number of git remotes.
+const defaultRemotesForLookup = 5
 
 func ResolveRemotesToRepos(remotes Remotes, client *api.Client, base string) (*ResolvedRemotes, error) {
 	sort.Stable(remotes)
@@ -38,11 +37,11 @@ func ResolveRemotesToRepos(remotes Remotes, client *api.Client, base string) (*R
 	return result, nil
 }
 
-func resolveNetwork(result *ResolvedRemotes) error {
+func resolveNetwork(result *ResolvedRemotes, remotesForLookup int) error {
 	var repos []ghrepo.Interface
 	for _, r := range result.remotes {
 		repos = append(repos, r)
-		if len(repos) == maxRemotesForLookup {
+		if len(repos) == remotesForLookup {
 			break
 		}
 	}
@@ -64,6 +63,10 @@ func (r *ResolvedRemotes) BaseRepo(io *iostreams.IOStreams) (ghrepo.Interface, e
 		return r.baseOverride, nil
 	}
 
+	if len(r.remotes) == 0 {
+		return nil, errors.New("no git remotes")
+	}
+
 	// if any of the remotes already has a resolution, respect that
 	for _, r := range r.remotes {
 		if r.Resolved == "base" {
@@ -82,21 +85,66 @@ func (r *ResolvedRemotes) BaseRepo(io *iostreams.IOStreams) (ghrepo.Interface, e
 		return r.remotes[0], nil
 	}
 
-	// from here on, consult the API
+	repos, err := r.NetworkRepos(defaultRemotesForLookup)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(repos) == 0 {
+		return r.remotes[0], nil
+	} else if len(repos) == 1 {
+		return repos[0], nil
+	}
+
+	cs := io.ColorScheme()
+
+	fmt.Fprintf(io.ErrOut,
+		"%s No default remote repository has been set. To learn more about the default repository, run: gh repo set-default --help\n",
+		cs.FailureIcon())
+
+	fmt.Fprintln(io.Out)
+
+	return nil, errors.New(
+		"please run `gh repo set-default` to select a default remote repository.")
+}
+
+func (r *ResolvedRemotes) HeadRepos() ([]*api.Repository, error) {
 	if r.network == nil {
-		err := resolveNetwork(r)
+		err := resolveNetwork(r, defaultRemotesForLookup)
 		if err != nil {
 			return nil, err
 		}
 	}
 
-	var repoNames []string
-	repoMap := map[string]*api.Repository{}
+	var results []*api.Repository
+	var ids []string // Check if repo duplicates
+	for _, repo := range r.network.Repositories {
+		if repo != nil && repo.ViewerCanPush() && !slices.Contains(ids, repo.ID) {
+			results = append(results, repo)
+			ids = append(ids, repo.ID)
+		}
+	}
+	return results, nil
+}
+
+// NetworkRepos fetches info about remotes for the network of repos.
+// Pass a value of 0 to fetch info on all remotes.
+func (r *ResolvedRemotes) NetworkRepos(remotesForLookup int) ([]*api.Repository, error) {
+	if r.network == nil {
+		err := resolveNetwork(r, remotesForLookup)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	var repos []*api.Repository
+	repoMap := map[string]bool{}
+
 	add := func(r *api.Repository) {
 		fn := ghrepo.FullName(r)
 		if _, ok := repoMap[fn]; !ok {
-			repoMap[fn] = r
-			repoNames = append(repoNames, fn)
+			repoMap[fn] = true
+			repos = append(repos, r)
 		}
 	}
 
@@ -104,56 +152,13 @@ func (r *ResolvedRemotes) BaseRepo(io *iostreams.IOStreams) (ghrepo.Interface, e
 		if repo == nil {
 			continue
 		}
-		if repo.IsFork() {
+		if repo.Parent != nil {
 			add(repo.Parent)
 		}
 		add(repo)
 	}
 
-	if len(repoNames) == 0 {
-		return r.remotes[0], nil
-	}
-
-	baseName := repoNames[0]
-	if len(repoNames) > 1 {
-		err := prompt.SurveyAskOne(&survey.Select{
-			Message: "Which should be the base repository (used for e.g. querying issues) for this directory?",
-			Options: repoNames,
-		}, &baseName)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	// determine corresponding git remote
-	selectedRepo := repoMap[baseName]
-	resolution := "base"
-	remote, _ := r.RemoteForRepo(selectedRepo)
-	if remote == nil {
-		remote = r.remotes[0]
-		resolution = ghrepo.FullName(selectedRepo)
-	}
-
-	// cache the result to git config
-	err := git.SetRemoteResolution(remote.Name, resolution)
-	return selectedRepo, err
-}
-
-func (r *ResolvedRemotes) HeadRepos() ([]*api.Repository, error) {
-	if r.network == nil {
-		err := resolveNetwork(r)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	var results []*api.Repository
-	for _, repo := range r.network.Repositories {
-		if repo != nil && repo.ViewerCanPush() {
-			results = append(results, repo)
-		}
-	}
-	return results, nil
+	return repos, nil
 }
 
 // RemoteForRepo finds the git remote that points to a repository

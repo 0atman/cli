@@ -2,19 +2,20 @@ package delete
 
 import (
 	"fmt"
+	"sort"
 
-	"github.com/cli/cli/internal/config"
-	"github.com/cli/cli/pkg/cmdutil"
-	"github.com/cli/cli/pkg/iostreams"
-	"github.com/cli/cli/utils"
+	"github.com/cli/cli/v2/internal/gh"
+	"github.com/cli/cli/v2/pkg/cmdutil"
+	"github.com/cli/cli/v2/pkg/iostreams"
 	"github.com/spf13/cobra"
 )
 
 type DeleteOptions struct {
-	Config func() (config.Config, error)
+	Config func() (gh.Config, error)
 	IO     *iostreams.IOStreams
 
 	Name string
+	All  bool
 }
 
 func NewCmdDelete(f *cmdutil.Factory, runF func(*DeleteOptions) error) *cobra.Command {
@@ -24,18 +25,27 @@ func NewCmdDelete(f *cmdutil.Factory, runF func(*DeleteOptions) error) *cobra.Co
 	}
 
 	cmd := &cobra.Command{
-		Use:   "delete <alias>",
-		Short: "Delete an alias",
-		Args:  cobra.ExactArgs(1),
+		Use:   "delete {<alias> | --all}",
+		Short: "Delete set aliases",
+		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			opts.Name = args[0]
-
+			if len(args) == 0 && !opts.All {
+				return cmdutil.FlagErrorf("specify an alias to delete or `--all`")
+			}
+			if len(args) > 0 && opts.All {
+				return cmdutil.FlagErrorf("cannot use `--all` with alias name")
+			}
+			if len(args) > 0 {
+				opts.Name = args[0]
+			}
 			if runF != nil {
 				return runF(opts)
 			}
 			return deleteRun(opts)
 		},
 	}
+
+	cmd.Flags().BoolVar(&opts.All, "all", false, "Delete all aliases")
 
 	return cmd
 }
@@ -46,25 +56,42 @@ func deleteRun(opts *DeleteOptions) error {
 		return err
 	}
 
-	aliasCfg, err := cfg.Aliases()
-	if err != nil {
-		return fmt.Errorf("couldn't read aliases config: %w", err)
+	aliasCfg := cfg.Aliases()
+
+	aliases := make(map[string]string)
+	if opts.All {
+		aliases = aliasCfg.All()
+		if len(aliases) == 0 {
+			return cmdutil.NewNoResultsError("no aliases configured")
+		}
+	} else {
+		expansion, err := aliasCfg.Get(opts.Name)
+		if err != nil {
+			return fmt.Errorf("no such alias %s", opts.Name)
+		}
+		aliases[opts.Name] = expansion
 	}
 
-	expansion, ok := aliasCfg.Get(opts.Name)
-	if !ok {
-		return fmt.Errorf("no such alias %s", opts.Name)
-
+	for name := range aliases {
+		if err := aliasCfg.Delete(name); err != nil {
+			return fmt.Errorf("failed to delete alias %s: %w", name, err)
+		}
 	}
 
-	err = aliasCfg.Delete(opts.Name)
-	if err != nil {
-		return fmt.Errorf("failed to delete alias %s: %w", opts.Name, err)
+	if err := cfg.Write(); err != nil {
+		return err
 	}
 
 	if opts.IO.IsStdoutTTY() {
-		redCheck := utils.Red("✓")
-		fmt.Fprintf(opts.IO.ErrOut, "%s Deleted alias %s; was %s\n", redCheck, opts.Name, expansion)
+		cs := opts.IO.ColorScheme()
+		keys := make([]string, 0, len(aliases))
+		for k := range aliases {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			fmt.Fprintf(opts.IO.ErrOut, "%s Deleted alias %s; was %s\n", cs.SuccessIconWithColor(cs.Red), k, aliases[k])
+		}
 	}
 
 	return nil

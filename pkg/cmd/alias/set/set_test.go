@@ -2,251 +2,354 @@ package set
 
 import (
 	"bytes"
-	"io/ioutil"
+	"fmt"
 	"testing"
 
-	"github.com/MakeNowJust/heredoc"
-	"github.com/cli/cli/internal/config"
-	"github.com/cli/cli/pkg/cmdutil"
-	"github.com/cli/cli/pkg/iostreams"
-	"github.com/cli/cli/test"
+	"github.com/cli/cli/v2/internal/config"
+	"github.com/cli/cli/v2/internal/gh"
+	"github.com/cli/cli/v2/pkg/cmd/alias/shared"
+	"github.com/cli/cli/v2/pkg/cmdutil"
+	"github.com/cli/cli/v2/pkg/iostreams"
 	"github.com/google/shlex"
 	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
-func runCommand(cfg config.Config, isTTY bool, cli string) (*test.CmdOut, error) {
-	io, _, stdout, stderr := iostreams.Test()
-	io.SetStdoutTTY(isTTY)
-	io.SetStdinTTY(isTTY)
-	io.SetStderrTTY(isTTY)
-
-	factory := &cmdutil.Factory{
-		IOStreams: io,
-		Config: func() (config.Config, error) {
-			return cfg, nil
+func TestNewCmdSet(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		output  SetOptions
+		wantErr bool
+		errMsg  string
+	}{
+		{
+			name:    "no arguments",
+			input:   "",
+			wantErr: true,
+			errMsg:  "accepts 2 arg(s), received 0",
+		},
+		{
+			name:    "only one argument",
+			input:   "name",
+			wantErr: true,
+			errMsg:  "accepts 2 arg(s), received 1",
+		},
+		{
+			name:  "name and expansion",
+			input: "alias-name alias-expansion",
+			output: SetOptions{
+				Name:      "alias-name",
+				Expansion: "alias-expansion",
+			},
+		},
+		{
+			name:  "shell flag",
+			input: "alias-name alias-expansion --shell",
+			output: SetOptions{
+				Name:      "alias-name",
+				Expansion: "alias-expansion",
+				IsShell:   true,
+			},
+		},
+		{
+			name:  "clobber flag",
+			input: "alias-name alias-expansion --clobber",
+			output: SetOptions{
+				Name:              "alias-name",
+				Expansion:         "alias-expansion",
+				OverwriteExisting: true,
+			},
 		},
 	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ios, _, _, _ := iostreams.Test()
+			f := &cmdutil.Factory{
+				IOStreams: ios,
+			}
+			argv, err := shlex.Split(tt.input)
+			assert.NoError(t, err)
+			var gotOpts *SetOptions
+			cmd := NewCmdSet(f, func(opts *SetOptions) error {
+				gotOpts = opts
+				return nil
+			})
+			cmd.SetArgs(argv)
+			cmd.SetIn(&bytes.Buffer{})
+			cmd.SetOut(&bytes.Buffer{})
+			cmd.SetErr(&bytes.Buffer{})
 
-	cmd := NewCmdSet(factory, nil)
-
-	// fake command nesting structure needed for validCommand
-	rootCmd := &cobra.Command{}
-	rootCmd.AddCommand(cmd)
-	prCmd := &cobra.Command{Use: "pr"}
-	prCmd.AddCommand(&cobra.Command{Use: "checkout"})
-	prCmd.AddCommand(&cobra.Command{Use: "status"})
-	rootCmd.AddCommand(prCmd)
-	issueCmd := &cobra.Command{Use: "issue"}
-	issueCmd.AddCommand(&cobra.Command{Use: "list"})
-	rootCmd.AddCommand(issueCmd)
-
-	argv, err := shlex.Split("set " + cli)
-	if err != nil {
-		return nil, err
-	}
-	rootCmd.SetArgs(argv)
-
-	rootCmd.SetIn(&bytes.Buffer{})
-	rootCmd.SetOut(ioutil.Discard)
-	rootCmd.SetErr(ioutil.Discard)
-
-	_, err = rootCmd.ExecuteC()
-	return &test.CmdOut{
-		OutBuf: stdout,
-		ErrBuf: stderr,
-	}, err
-}
-
-func TestAliasSet_gh_command(t *testing.T) {
-	defer config.StubWriteConfig(ioutil.Discard, ioutil.Discard)()
-
-	cfg := config.NewFromString(``)
-
-	_, err := runCommand(cfg, true, "pr 'pr status'")
-
-	if assert.Error(t, err) {
-		assert.Equal(t, `could not create alias: "pr" is already a gh command`, err.Error())
-	}
-}
-
-func TestAliasSet_empty_aliases(t *testing.T) {
-	mainBuf := bytes.Buffer{}
-	defer config.StubWriteConfig(&mainBuf, ioutil.Discard)()
-
-	cfg := config.NewFromString(heredoc.Doc(`
-		aliases:
-		editor: vim
-	`))
-
-	output, err := runCommand(cfg, true, "co 'pr checkout'")
-
-	if err != nil {
-		t.Fatalf("unexpected error: %s", err)
-	}
-
-	test.ExpectLines(t, output.Stderr(), "Added alias")
-	test.ExpectLines(t, output.String(), "")
-
-	expected := `aliases:
-    co: pr checkout
-editor: vim
-`
-	assert.Equal(t, expected, mainBuf.String())
-}
-
-func TestAliasSet_existing_alias(t *testing.T) {
-	mainBuf := bytes.Buffer{}
-	defer config.StubWriteConfig(&mainBuf, ioutil.Discard)()
-
-	cfg := config.NewFromString(heredoc.Doc(`
-		aliases:
-		  co: pr checkout
-	`))
-
-	output, err := runCommand(cfg, true, "co 'pr checkout -Rcool/repo'")
-	require.NoError(t, err)
-
-	test.ExpectLines(t, output.Stderr(), "Changed alias.*co.*from.*pr checkout.*to.*pr checkout -Rcool/repo")
-}
-
-func TestAliasSet_space_args(t *testing.T) {
-	mainBuf := bytes.Buffer{}
-	defer config.StubWriteConfig(&mainBuf, ioutil.Discard)()
-
-	cfg := config.NewFromString(``)
-
-	output, err := runCommand(cfg, true, `il 'issue list -l "cool story"'`)
-	require.NoError(t, err)
-
-	test.ExpectLines(t, output.Stderr(), `Adding alias for.*il.*issue list -l "cool story"`)
-
-	test.ExpectLines(t, mainBuf.String(), `il: issue list -l "cool story"`)
-}
-
-func TestAliasSet_arg_processing(t *testing.T) {
-	cases := []struct {
-		Cmd                string
-		ExpectedOutputLine string
-		ExpectedConfigLine string
-	}{
-		{`il "issue list"`, "- Adding alias for.*il.*issue list", "il: issue list"},
-
-		{`iz 'issue list'`, "- Adding alias for.*iz.*issue list", "iz: issue list"},
-
-		{`ii 'issue list --author="$1" --label="$2"'`,
-			`- Adding alias for.*ii.*issue list --author="\$1" --label="\$2"`,
-			`ii: issue list --author="\$1" --label="\$2"`},
-
-		{`ix "issue list --author='\$1' --label='\$2'"`,
-			`- Adding alias for.*ix.*issue list --author='\$1' --label='\$2'`,
-			`ix: issue list --author='\$1' --label='\$2'`},
-	}
-
-	for _, c := range cases {
-		t.Run(c.Cmd, func(t *testing.T) {
-			mainBuf := bytes.Buffer{}
-			defer config.StubWriteConfig(&mainBuf, ioutil.Discard)()
-
-			cfg := config.NewFromString(``)
-
-			output, err := runCommand(cfg, true, c.Cmd)
-			if err != nil {
-				t.Fatalf("got unexpected error running %s: %s", c.Cmd, err)
+			_, err = cmd.ExecuteC()
+			if tt.wantErr {
+				assert.EqualError(t, err, tt.errMsg)
+				return
 			}
 
-			test.ExpectLines(t, output.Stderr(), c.ExpectedOutputLine)
-			test.ExpectLines(t, mainBuf.String(), c.ExpectedConfigLine)
+			assert.NoError(t, err)
+			assert.Equal(t, tt.output.Name, gotOpts.Name)
+			assert.Equal(t, tt.output.Expansion, gotOpts.Expansion)
+			assert.Equal(t, tt.output.IsShell, gotOpts.IsShell)
+			assert.Equal(t, tt.output.OverwriteExisting, gotOpts.OverwriteExisting)
 		})
 	}
 }
 
-func TestAliasSet_init_alias_cfg(t *testing.T) {
-	mainBuf := bytes.Buffer{}
-	defer config.StubWriteConfig(&mainBuf, ioutil.Discard)()
+func TestSetRun(t *testing.T) {
+	tests := []struct {
+		name          string
+		tty           bool
+		opts          *SetOptions
+		stdin         string
+		wantExpansion string
+		wantStdout    string
+		wantStderr    string
+		wantErrMsg    string
+	}{
+		{
+			name: "creates alias tty",
+			tty:  true,
+			opts: &SetOptions{
+				Name:      "foo",
+				Expansion: "bar",
+			},
+			wantExpansion: "bar",
+			wantStderr:    "- Creating alias for foo: bar\n✓ Added alias foo\n",
+		},
+		{
+			name: "creates alias",
+			opts: &SetOptions{
+				Name:      "foo",
+				Expansion: "bar",
+			},
+			wantExpansion: "bar",
+		},
+		{
+			name: "creates shell alias tty",
+			tty:  true,
+			opts: &SetOptions{
+				Name:      "igrep",
+				Expansion: "!gh issue list | grep",
+			},
+			wantExpansion: "!gh issue list | grep",
+			wantStderr:    "- Creating alias for igrep: !gh issue list | grep\n✓ Added alias igrep\n",
+		},
+		{
+			name: "creates shell alias",
+			opts: &SetOptions{
+				Name:      "igrep",
+				Expansion: "!gh issue list | grep",
+			},
+			wantExpansion: "!gh issue list | grep",
+		},
+		{
+			name: "creates shell alias using flag tty",
+			tty:  true,
+			opts: &SetOptions{
+				Name:      "igrep",
+				Expansion: "gh issue list | grep",
+				IsShell:   true,
+			},
+			wantExpansion: "!gh issue list | grep",
+			wantStderr:    "- Creating alias for igrep: !gh issue list | grep\n✓ Added alias igrep\n",
+		},
+		{
+			name: "creates shell alias using flag",
+			opts: &SetOptions{
+				Name:      "igrep",
+				Expansion: "gh issue list | grep",
+				IsShell:   true,
+			},
+			wantExpansion: "!gh issue list | grep",
+		},
+		{
+			name: "creates alias where expansion has args tty",
+			tty:  true,
+			opts: &SetOptions{
+				Name:      "foo",
+				Expansion: "bar baz --author='$1' --label='$2'",
+			},
+			wantExpansion: "bar baz --author='$1' --label='$2'",
+			wantStderr:    "- Creating alias for foo: bar baz --author='$1' --label='$2'\n✓ Added alias foo\n",
+		},
+		{
+			name: "creates alias where expansion has args",
+			opts: &SetOptions{
+				Name:      "foo",
+				Expansion: "bar baz --author='$1' --label='$2'",
+			},
+			wantExpansion: "bar baz --author='$1' --label='$2'",
+		},
+		{
+			name: "creates alias from stdin tty",
+			tty:  true,
+			opts: &SetOptions{
+				Name:      "foo",
+				Expansion: "-",
+			},
+			stdin:         `bar baz --author="$1" --label="$2"`,
+			wantExpansion: `bar baz --author="$1" --label="$2"`,
+			wantStderr:    "- Creating alias for foo: bar baz --author=\"$1\" --label=\"$2\"\n✓ Added alias foo\n",
+		},
+		{
+			name: "creates alias from stdin",
+			opts: &SetOptions{
+				Name:      "foo",
+				Expansion: "-",
+			},
+			stdin:         `bar baz --author="$1" --label="$2"`,
+			wantExpansion: `bar baz --author="$1" --label="$2"`,
+		},
+		{
+			name: "overwrites existing alias tty",
+			tty:  true,
+			opts: &SetOptions{
+				Name:              "co",
+				Expansion:         "bar",
+				OverwriteExisting: true,
+			},
+			wantExpansion: "bar",
+			wantStderr:    "- Creating alias for co: bar\n! Changed alias co\n",
+		},
+		{
+			name: "overwrites existing alias",
+			opts: &SetOptions{
+				Name:              "co",
+				Expansion:         "bar",
+				OverwriteExisting: true,
+			},
+			wantExpansion: "bar",
+		},
+		{
+			name: "fails when alias name is an existing alias tty",
+			tty:  true,
+			opts: &SetOptions{
+				Name:      "co",
+				Expansion: "bar",
+			},
+			wantExpansion: "pr checkout",
+			wantErrMsg:    "X Could not create alias co: name already taken, use the --clobber flag to overwrite it",
+			wantStderr:    "- Creating alias for co: bar\n",
+		},
+		{
+			name: "fails when alias name is an existing alias",
+			opts: &SetOptions{
+				Name:      "co",
+				Expansion: "bar",
+			},
+			wantExpansion: "pr checkout",
+			wantErrMsg:    "X Could not create alias co: name already taken, use the --clobber flag to overwrite it",
+		},
+		{
+			name: "fails when alias expansion is not an existing command tty",
+			tty:  true,
+			opts: &SetOptions{
+				Name:      "foo",
+				Expansion: "baz",
+			},
+			wantErrMsg: "X Could not create alias foo: expansion does not correspond to a gh command, extension, or alias",
+			wantStderr: "- Creating alias for foo: baz\n",
+		},
+		{
+			name: "fails when alias expansion is not an existing command",
+			opts: &SetOptions{
+				Name:      "foo",
+				Expansion: "baz",
+			},
+			wantErrMsg: "X Could not create alias foo: expansion does not correspond to a gh command, extension, or alias",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rootCmd := &cobra.Command{}
+			barCmd := &cobra.Command{Use: "bar"}
+			barCmd.AddCommand(&cobra.Command{Use: "baz"})
+			rootCmd.AddCommand(barCmd)
+			coCmd := &cobra.Command{Use: "co"}
+			rootCmd.AddCommand(coCmd)
 
-	cfg := config.NewFromString(heredoc.Doc(`
-		editor: vim
-	`))
+			tt.opts.validAliasName = shared.ValidAliasNameFunc(rootCmd)
+			tt.opts.validAliasExpansion = shared.ValidAliasExpansionFunc(rootCmd)
 
-	output, err := runCommand(cfg, true, "diff 'pr diff'")
-	require.NoError(t, err)
+			ios, stdin, stdout, stderr := iostreams.Test()
+			ios.SetStdinTTY(tt.tty)
+			ios.SetStdoutTTY(tt.tty)
+			ios.SetStderrTTY(tt.tty)
+			tt.opts.IO = ios
 
-	expected := `editor: vim
-aliases:
-    diff: pr diff
-`
+			if tt.stdin != "" {
+				fmt.Fprint(stdin, tt.stdin)
+			}
 
-	test.ExpectLines(t, output.Stderr(), "Adding alias for.*diff.*pr diff", "Added alias.")
-	assert.Equal(t, expected, mainBuf.String())
-}
+			cfg := config.NewBlankConfig()
+			cfg.WriteFunc = func() error {
+				return nil
+			}
+			tt.opts.Config = func() (gh.Config, error) {
+				return cfg, nil
+			}
 
-func TestAliasSet_existing_aliases(t *testing.T) {
-	mainBuf := bytes.Buffer{}
-	defer config.StubWriteConfig(&mainBuf, ioutil.Discard)()
+			err := setRun(tt.opts)
+			if tt.wantErrMsg != "" {
+				assert.EqualError(t, err, tt.wantErrMsg)
+				writeCalls := cfg.WriteCalls()
+				assert.Equal(t, 0, len(writeCalls))
+			} else {
+				assert.NoError(t, err)
+				writeCalls := cfg.WriteCalls()
+				assert.Equal(t, 1, len(writeCalls))
+			}
 
-	cfg := config.NewFromString(heredoc.Doc(`
-		aliases:
-		  foo: bar
-	`))
-
-	output, err := runCommand(cfg, true, "view 'pr view'")
-	require.NoError(t, err)
-
-	expected := `aliases:
-    foo: bar
-    view: pr view
-`
-
-	test.ExpectLines(t, output.Stderr(), "Adding alias for.*view.*pr view", "Added alias.")
-	assert.Equal(t, expected, mainBuf.String())
-
-}
-
-func TestAliasSet_invalid_command(t *testing.T) {
-	defer config.StubWriteConfig(ioutil.Discard, ioutil.Discard)()
-
-	cfg := config.NewFromString(``)
-
-	_, err := runCommand(cfg, true, "co 'pe checkout'")
-	if assert.Error(t, err) {
-		assert.Equal(t, "could not create alias: pe checkout does not correspond to a gh command", err.Error())
+			ac := cfg.Aliases()
+			expansion, _ := ac.Get(tt.opts.Name)
+			assert.Equal(t, tt.wantExpansion, expansion)
+			assert.Equal(t, tt.wantStdout, stdout.String())
+			assert.Equal(t, tt.wantStderr, stderr.String())
+		})
 	}
 }
 
-func TestShellAlias_flag(t *testing.T) {
-	mainBuf := bytes.Buffer{}
-	defer config.StubWriteConfig(&mainBuf, ioutil.Discard)()
-
-	cfg := config.NewFromString(``)
-
-	output, err := runCommand(cfg, true, "--shell igrep 'gh issue list | grep'")
-	if err != nil {
-		t.Fatalf("unexpected error: %s", err)
+func TestGetExpansion(t *testing.T) {
+	tests := []struct {
+		name         string
+		want         string
+		expansionArg string
+		stdin        string
+	}{
+		{
+			name:         "co",
+			want:         "pr checkout",
+			expansionArg: "pr checkout",
+		},
+		{
+			name:         "co",
+			want:         "pr checkout",
+			expansionArg: "pr checkout",
+			stdin:        "api graphql -F name=\"$1\"",
+		},
+		{
+			name:         "stdin",
+			expansionArg: "-",
+			want:         "api graphql -F name=\"$1\"",
+			stdin:        "api graphql -F name=\"$1\"",
+		},
 	}
 
-	test.ExpectLines(t, output.Stderr(), "Adding alias for.*igrep")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ios, stdin, _, _ := iostreams.Test()
+			ios.SetStdinTTY(false)
 
-	expected := `aliases:
-    igrep: '!gh issue list | grep'
-`
-	assert.Equal(t, expected, mainBuf.String())
-}
+			_, err := stdin.WriteString(tt.stdin)
+			assert.NoError(t, err)
 
-func TestShellAlias_bang(t *testing.T) {
-	mainBuf := bytes.Buffer{}
-	defer config.StubWriteConfig(&mainBuf, ioutil.Discard)()
+			expansion, err := getExpansion(&SetOptions{
+				Expansion: tt.expansionArg,
+				IO:        ios,
+			})
+			assert.NoError(t, err)
 
-	cfg := config.NewFromString(``)
-
-	output, err := runCommand(cfg, true, "igrep '!gh issue list | grep'")
-	require.NoError(t, err)
-
-	test.ExpectLines(t, output.Stderr(), "Adding alias for.*igrep")
-
-	expected := `aliases:
-    igrep: '!gh issue list | grep'
-`
-	assert.Equal(t, expected, mainBuf.String())
+			assert.Equal(t, expansion, tt.want)
+		})
+	}
 }

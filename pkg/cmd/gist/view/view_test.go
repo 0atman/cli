@@ -2,15 +2,21 @@ package view
 
 import (
 	"bytes"
+	"fmt"
 	"net/http"
 	"testing"
+	"time"
 
-	"github.com/cli/cli/pkg/cmd/gist/shared"
-	"github.com/cli/cli/pkg/cmdutil"
-	"github.com/cli/cli/pkg/httpmock"
-	"github.com/cli/cli/pkg/iostreams"
+	"github.com/cli/cli/v2/internal/config"
+	"github.com/cli/cli/v2/internal/gh"
+	"github.com/cli/cli/v2/internal/prompter"
+	"github.com/cli/cli/v2/pkg/cmd/gist/shared"
+	"github.com/cli/cli/v2/pkg/cmdutil"
+	"github.com/cli/cli/v2/pkg/httpmock"
+	"github.com/cli/cli/v2/pkg/iostreams"
 	"github.com/google/shlex"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestNewCmdView(t *testing.T) {
@@ -25,16 +31,18 @@ func TestNewCmdView(t *testing.T) {
 			tty:  true,
 			cli:  "123",
 			wants: ViewOptions{
-				Raw:      false,
-				Selector: "123",
+				Raw:       false,
+				Selector:  "123",
+				ListFiles: false,
 			},
 		},
 		{
 			name: "nontty no arguments",
 			cli:  "123",
 			wants: ViewOptions{
-				Raw:      true,
-				Selector: "123",
+				Raw:       true,
+				Selector:  "123",
+				ListFiles: false,
 			},
 		},
 		{
@@ -42,20 +50,41 @@ func TestNewCmdView(t *testing.T) {
 			cli:  "-fcool.txt 123",
 			tty:  true,
 			wants: ViewOptions{
-				Raw:      false,
-				Selector: "123",
-				Filename: "cool.txt",
+				Raw:       false,
+				Selector:  "123",
+				Filename:  "cool.txt",
+				ListFiles: false,
+			},
+		},
+		{
+			name: "files passed",
+			cli:  "--files 123",
+			tty:  true,
+			wants: ViewOptions{
+				Raw:       false,
+				Selector:  "123",
+				ListFiles: true,
+			},
+		},
+		{
+			name: "tty no ID supplied",
+			cli:  "",
+			tty:  true,
+			wants: ViewOptions{
+				Raw:       false,
+				Selector:  "",
+				ListFiles: true,
 			},
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			io, _, _, _ := iostreams.Test()
-			io.SetStdoutTTY(tt.tty)
+			ios, _, _, _ := iostreams.Test()
+			ios.SetStdoutTTY(tt.tty)
 
 			f := &cmdutil.Factory{
-				IOStreams: io,
+				IOStreams: ios,
 			}
 
 			argv, err := shlex.Split(tt.cli)
@@ -66,6 +95,7 @@ func TestNewCmdView(t *testing.T) {
 				gotOpts = opts
 				return nil
 			})
+
 			cmd.SetArgs(argv)
 			cmd.SetIn(&bytes.Buffer{})
 			cmd.SetOut(&bytes.Buffer{})
@@ -83,34 +113,72 @@ func TestNewCmdView(t *testing.T) {
 
 func Test_viewRun(t *testing.T) {
 	tests := []struct {
-		name    string
-		opts    *ViewOptions
-		wantOut string
-		gist    *shared.Gist
-		wantErr bool
+		name         string
+		opts         *ViewOptions
+		wantOut      string
+		mockGist     *shared.Gist
+		mockGistList bool
+		isTTY        bool
+		wantErr      string
 	}{
 		{
-			name:    "no such gist",
-			wantErr: true,
-		},
-		{
-			name: "one file",
-			gist: &shared.Gist{
-				Files: map[string]*shared.GistFile{
-					"cicada.txt": {
-						Content: "bwhiizzzbwhuiiizzzz",
-						Type:    "text/plain",
-					},
-				},
-			},
-			wantOut: "bwhiizzzbwhuiiizzzz\n\n",
-		},
-		{
-			name: "filename selected",
+			name:  "no such gist",
+			isTTY: false,
 			opts: &ViewOptions{
-				Filename: "cicada.txt",
+				Selector:  "1234",
+				ListFiles: false,
 			},
-			gist: &shared.Gist{
+			wantErr: "not found",
+		},
+		{
+			name:  "one file",
+			isTTY: true,
+			opts: &ViewOptions{
+				Selector:  "1234",
+				ListFiles: false,
+			},
+			mockGist: &shared.Gist{
+				Files: map[string]*shared.GistFile{
+					"cicada.txt": {
+						Content: "bwhiizzzbwhuiiizzzz",
+						Type:    "text/plain",
+					},
+				},
+			},
+			wantOut: "bwhiizzzbwhuiiizzzz\n",
+		},
+		{
+			name:  "one file, no ID supplied",
+			isTTY: true,
+			opts: &ViewOptions{
+				Selector:  "",
+				ListFiles: false,
+			},
+			mockGistList: true,
+			mockGist: &shared.Gist{
+				Files: map[string]*shared.GistFile{
+					"cicada.txt": {
+						Content: "test interactive mode",
+						Type:    "text/plain",
+					},
+				},
+			},
+			wantOut: "test interactive mode\n",
+		},
+		{
+			name:    "no arguments notty",
+			isTTY:   false,
+			wantErr: "gist ID or URL required when not running interactively",
+		},
+		{
+			name:  "filename selected",
+			isTTY: true,
+			opts: &ViewOptions{
+				Selector:  "1234",
+				Filename:  "cicada.txt",
+				ListFiles: false,
+			},
+			mockGist: &shared.Gist{
 				Files: map[string]*shared.GistFile{
 					"cicada.txt": {
 						Content: "bwhiizzzbwhuiiizzzz",
@@ -122,11 +190,18 @@ func Test_viewRun(t *testing.T) {
 					},
 				},
 			},
-			wantOut: "bwhiizzzbwhuiiizzzz\n\n",
+			wantOut: "bwhiizzzbwhuiiizzzz\n",
 		},
 		{
-			name: "multiple files, no description",
-			gist: &shared.Gist{
+			name:  "filename selected, raw",
+			isTTY: true,
+			opts: &ViewOptions{
+				Selector:  "1234",
+				Filename:  "cicada.txt",
+				Raw:       true,
+				ListFiles: false,
+			},
+			mockGist: &shared.Gist{
 				Files: map[string]*shared.GistFile{
 					"cicada.txt": {
 						Content: "bwhiizzzbwhuiiizzzz",
@@ -138,11 +213,58 @@ func Test_viewRun(t *testing.T) {
 					},
 				},
 			},
-			wantOut: "cicada.txt\n\nbwhiizzzbwhuiiizzzz\n\nfoo.md\n\n\n  # foo                                                                       \n\n\n\n",
+			wantOut: "bwhiizzzbwhuiiizzzz\n",
 		},
 		{
-			name: "multiple files, description",
-			gist: &shared.Gist{
+			name:  "multiple files, no description",
+			isTTY: true,
+			opts: &ViewOptions{
+				Selector:  "1234",
+				ListFiles: false,
+			},
+			mockGist: &shared.Gist{
+				Files: map[string]*shared.GistFile{
+					"cicada.txt": {
+						Content: "bwhiizzzbwhuiiizzzz",
+						Type:    "text/plain",
+					},
+					"foo.md": {
+						Content: "# foo",
+						Type:    "application/markdown",
+					},
+				},
+			},
+			wantOut: "cicada.txt\n\nbwhiizzzbwhuiiizzzz\n\nfoo.md\n\n\n  # foo                                                                       \n\n",
+		},
+		{
+			name:  "multiple files, trailing newlines",
+			isTTY: true,
+			opts: &ViewOptions{
+				Selector:  "1234",
+				ListFiles: false,
+			},
+			mockGist: &shared.Gist{
+				Files: map[string]*shared.GistFile{
+					"cicada.txt": {
+						Content: "bwhiizzzbwhuiiizzzz\n",
+						Type:    "text/plain",
+					},
+					"foo.txt": {
+						Content: "bar\n",
+						Type:    "text/plain",
+					},
+				},
+			},
+			wantOut: "cicada.txt\n\nbwhiizzzbwhuiiizzzz\n\nfoo.txt\n\nbar\n",
+		},
+		{
+			name:  "multiple files, description",
+			isTTY: true,
+			opts: &ViewOptions{
+				Selector:  "1234",
+				ListFiles: false,
+			},
+			mockGist: &shared.Gist{
 				Description: "some files",
 				Files: map[string]*shared.GistFile{
 					"cicada.txt": {
@@ -155,14 +277,17 @@ func Test_viewRun(t *testing.T) {
 					},
 				},
 			},
-			wantOut: "some files\ncicada.txt\n\nbwhiizzzbwhuiiizzzz\n\nfoo.md\n\n\n                                                                              \n  • foo                                                                       \n\n\n\n",
+			wantOut: "some files\n\ncicada.txt\n\nbwhiizzzbwhuiiizzzz\n\nfoo.md\n\n\n                                                                              \n  • foo                                                                       \n\n",
 		},
 		{
-			name: "raw",
+			name:  "multiple files, raw",
+			isTTY: true,
 			opts: &ViewOptions{
-				Raw: true,
+				Selector:  "1234",
+				Raw:       true,
+				ListFiles: false,
 			},
-			gist: &shared.Gist{
+			mockGist: &shared.Gist{
 				Description: "some files",
 				Files: map[string]*shared.GistFile{
 					"cicada.txt": {
@@ -175,40 +300,115 @@ func Test_viewRun(t *testing.T) {
 					},
 				},
 			},
-			wantOut: "some files\ncicada.txt\n\nbwhiizzzbwhuiiizzzz\n\nfoo.md\n\n- foo\n\n",
+			wantOut: "some files\n\ncicada.txt\n\nbwhiizzzbwhuiiizzzz\n\nfoo.md\n\n- foo\n",
+		},
+		{
+			name:  "one file, list files",
+			isTTY: true,
+			opts: &ViewOptions{
+				Selector:  "1234",
+				Raw:       false,
+				ListFiles: true,
+			},
+			mockGist: &shared.Gist{
+				Description: "some files",
+				Files: map[string]*shared.GistFile{
+					"cicada.txt": {
+						Content: "bwhiizzzbwhuiiizzzz",
+						Type:    "text/plain",
+					},
+				},
+			},
+			wantOut: "cicada.txt\n",
+		},
+		{
+			name:  "multiple file, list files",
+			isTTY: true,
+			opts: &ViewOptions{
+				Selector:  "1234",
+				Raw:       false,
+				ListFiles: true,
+			},
+			mockGist: &shared.Gist{
+				Description: "some files",
+				Files: map[string]*shared.GistFile{
+					"cicada.txt": {
+						Content: "bwhiizzzbwhuiiizzzz",
+						Type:    "text/plain",
+					},
+					"foo.md": {
+						Content: "- foo",
+						Type:    "application/markdown",
+					},
+				},
+			},
+			wantOut: "cicada.txt\nfoo.md\n",
 		},
 	}
 
 	for _, tt := range tests {
 		reg := &httpmock.Registry{}
-		if tt.gist == nil {
+		if tt.mockGist == nil {
 			reg.Register(httpmock.REST("GET", "gists/1234"),
 				httpmock.StatusStringResponse(404, "Not Found"))
 		} else {
 			reg.Register(httpmock.REST("GET", "gists/1234"),
-				httpmock.JSONResponse(tt.gist))
+				httpmock.JSONResponse(tt.mockGist))
 		}
 
 		if tt.opts == nil {
 			tt.opts = &ViewOptions{}
 		}
 
+		if tt.mockGistList {
+			sixHours, _ := time.ParseDuration("6h")
+			sixHoursAgo := time.Now().Add(-sixHours)
+			reg.Register(
+				httpmock.GraphQL(`query GistList\b`),
+				httpmock.StringResponse(fmt.Sprintf(
+					`{ "data": { "viewer": { "gists": { "nodes": [
+							{
+								"name": "1234",
+								"files": [{ "name": "cool.txt" }],
+								"description": "",
+								"updatedAt": "%s",
+								"isPublic": true
+							}
+						] } } } }`,
+					sixHoursAgo.Format(time.RFC3339),
+				)),
+			)
+
+			pm := prompter.NewMockPrompter(t)
+			pm.RegisterSelect("Select a gist", []string{"cool.txt  about 6 hours ago"}, func(_, _ string, opts []string) (int, error) {
+				return 0, nil
+			})
+			tt.opts.Prompter = pm
+		}
+
 		tt.opts.HttpClient = func() (*http.Client, error) {
 			return &http.Client{Transport: reg}, nil
 		}
-		io, _, stdout, _ := iostreams.Test()
-		io.SetStdoutTTY(true)
-		tt.opts.IO = io
 
-		tt.opts.Selector = "1234"
+		tt.opts.Config = func() (gh.Config, error) {
+			return config.NewBlankConfig(), nil
+		}
+
+		ios, _, stdout, _ := iostreams.Test()
+		ios.SetStdoutTTY(tt.isTTY)
+		ios.SetStdinTTY(tt.isTTY)
+		ios.SetStderrTTY(tt.isTTY)
+
+		tt.opts.IO = ios
 
 		t.Run(tt.name, func(t *testing.T) {
 			err := viewRun(tt.opts)
-			if tt.wantErr {
-				assert.Error(t, err)
+			if tt.wantErr != "" {
+				require.EqualError(t, err, tt.wantErr)
 				return
+			} else {
+				require.NoError(t, err)
 			}
-			assert.NoError(t, err)
 
 			assert.Equal(t, tt.wantOut, stdout.String())
 			reg.Verify(t)

@@ -13,11 +13,11 @@ import (
 	"time"
 
 	"github.com/MakeNowJust/heredoc"
-	"github.com/cli/cli/api"
-	"github.com/cli/cli/internal/ghrepo"
-	"github.com/cli/cli/pkg/cmdutil"
-	"github.com/cli/cli/pkg/iostreams"
-	"github.com/cli/cli/utils"
+	"github.com/cli/cli/v2/api"
+	"github.com/cli/cli/v2/internal/ghrepo"
+	"github.com/cli/cli/v2/pkg/cmdutil"
+	"github.com/cli/cli/v2/pkg/iostreams"
+	"github.com/cli/cli/v2/utils"
 	"github.com/spf13/cobra"
 )
 
@@ -43,13 +43,13 @@ func NewCmdCredits(f *cmdutil.Factory, runF func(*CreditsOptions) error) *cobra.
 		Short: "View credits for this tool",
 		Long:  `View animated credits for gh, the tool you are currently using :)`,
 		Example: heredoc.Doc(`
-			# see a credits animation for this project
+			# See a credits animation for this project
 			$ gh credits
-			
-			# display a non-animated thank you
+
+			# Display a non-animated thank you
 			$ gh credits -s
-			
-			# just print the contributors, one per line
+
+			# Just print the contributors, one per line
 			$ gh credits | cat
 		`),
 		Args: cobra.ExactArgs(0),
@@ -79,18 +79,18 @@ func NewCmdRepoCredits(f *cmdutil.Factory, runF func(*CreditsOptions) error) *co
 		Use:   "credits [<repository>]",
 		Short: "View credits for a repository",
 		Example: heredoc.Doc(`
-      # view credits for the current repository
-      $ gh repo credits
+			# View credits for the current repository
+			$ gh repo credits
 
-      # view credits for a specific repository
-      $ gh repo credits cool/repo
+			# View credits for a specific repository
+			$ gh repo credits cool/repo
 
-      # print a non-animated thank you
-      $ gh repo credits -s
+			# Print a non-animated thank you
+			$ gh repo credits -s
 
-      # pipe to just print the contributors, one per line
-      $ gh repo credits | cat
-    `),
+			# Pipe to just print the contributors, one per line
+			$ gh repo credits | cat
+		`),
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if len(args) > 0 {
@@ -154,6 +154,7 @@ func creditsRun(opts *CreditsOptions) error {
 	static := opts.Static || isWindows
 
 	out := opts.IO.Out
+	cs := opts.IO.ColorScheme()
 
 	if isTTY && static {
 		fmt.Fprintln(out, "THANK YOU CONTRIBUTORS!!! <3")
@@ -167,7 +168,7 @@ func creditsRun(opts *CreditsOptions) error {
 		}
 
 		if isTTY && !static {
-			logins = append(logins, getColor(x)(c.Login))
+			logins = append(logins, cs.ColorFromString(getColor(x))(c.Login))
 		} else {
 			fmt.Fprintf(out, "%s\n", c.Login)
 		}
@@ -177,20 +178,19 @@ func creditsRun(opts *CreditsOptions) error {
 		return nil
 	}
 
-	rand.Seed(time.Now().UnixNano())
+	r := rand.New(rand.NewSource(time.Now().UnixNano()))
 
 	lines := []string{}
 
 	thankLines := strings.Split(thankYou, "\n")
 	for x, tl := range thankLines {
-		lines = append(lines, getColor(x)(tl))
+		lines = append(lines, cs.ColorFromString(getColor(x))(tl))
 	}
 	lines = append(lines, "")
 	lines = append(lines, logins...)
 	lines = append(lines, "( <3 press ctrl-c to quit <3 )")
 
 	termWidth, termHeight, err := utils.TerminalSize(out)
-	//termWidth, termHeight, err := terminal.GetSize(int(outFile.Fd()))
 	if err != nil {
 		return err
 	}
@@ -199,13 +199,13 @@ func creditsRun(opts *CreditsOptions) error {
 
 	starLinesLeft := []string{}
 	for x := 0; x < len(lines); x++ {
-		starLinesLeft = append(starLinesLeft, starLine(margin))
+		starLinesLeft = append(starLinesLeft, starLine(r, margin))
 	}
 
 	starLinesRight := []string{}
 	for x := 0; x < len(lines); x++ {
 		lineWidth := termWidth - (margin + len(lines[x]))
-		starLinesRight = append(starLinesRight, starLine(lineWidth))
+		starLinesRight = append(starLinesRight, starLine(r, lineWidth))
 	}
 
 	loop := true
@@ -245,13 +245,13 @@ func creditsRun(opts *CreditsOptions) error {
 	return nil
 }
 
-func starLine(width int) string {
+func starLine(r *rand.Rand, width int) string {
 	line := ""
 	starChance := 0.1
 	for y := 0; y < width; y++ {
-		chance := rand.Float64()
+		chance := r.Float64()
 		if chance <= starChance {
-			charRoll := rand.Float64()
+			charRoll := r.Float64()
 			switch {
 			case charRoll < 0.3:
 				line += "."
@@ -277,14 +277,14 @@ func twinkle(starLine string) string {
 	return starLine
 }
 
-func getColor(x int) func(string) string {
-	rainbow := []func(string) string{
-		utils.Magenta,
-		utils.Red,
-		utils.Yellow,
-		utils.Green,
-		utils.Cyan,
-		utils.Blue,
+func getColor(x int) string {
+	rainbow := []string{
+		"magenta",
+		"red",
+		"yellow",
+		"green",
+		"cyan",
+		"blue",
 	}
 
 	ix := x % len(rainbow)

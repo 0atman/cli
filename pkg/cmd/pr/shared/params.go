@@ -5,57 +5,106 @@ import (
 	"net/url"
 	"strings"
 
-	"github.com/cli/cli/api"
-	"github.com/cli/cli/internal/ghrepo"
+	"github.com/cli/cli/v2/api"
+	"github.com/cli/cli/v2/internal/gh"
+	"github.com/cli/cli/v2/internal/ghrepo"
+	"github.com/cli/cli/v2/pkg/search"
+	"github.com/google/shlex"
 )
 
-func WithPrAndIssueQueryParams(baseURL, title, body string, assignees, labels, projects []string, milestones []string) (string, error) {
+func WithPrAndIssueQueryParams(client *api.Client, baseRepo ghrepo.Interface, baseURL string, state IssueMetadataState, projectsV1Support gh.ProjectsV1Support) (string, error) {
 	u, err := url.Parse(baseURL)
 	if err != nil {
 		return "", err
 	}
 	q := u.Query()
-	if title != "" {
-		q.Set("title", title)
+	if state.Title != "" {
+		q.Set("title", state.Title)
 	}
-	if body != "" {
-		q.Set("body", body)
+	// We always want to send the body parameter, even if it's empty, to prevent the web interface from
+	// applying the default template. Since the user has the option to select a template in the terminal,
+	// assume that empty body here means that the user either skipped it or erased its contents.
+	q.Set("body", state.Body)
+	if len(state.Assignees) > 0 {
+		q.Set("assignees", strings.Join(state.Assignees, ","))
 	}
-	if len(assignees) > 0 {
-		q.Set("assignees", strings.Join(assignees, ","))
+	// Set a template parameter if no body parameter is provided e.g. Web Mode
+	if len(state.Template) > 0 && len(state.Body) == 0 {
+		q.Set("template", state.Template)
 	}
-	if len(labels) > 0 {
-		q.Set("labels", strings.Join(labels, ","))
+	if len(state.Labels) > 0 {
+		q.Set("labels", strings.Join(state.Labels, ","))
 	}
-	if len(projects) > 0 {
-		q.Set("projects", strings.Join(projects, ","))
+	if len(state.ProjectTitles) > 0 {
+		projectPaths, err := api.ProjectTitlesToPaths(client, baseRepo, state.ProjectTitles, projectsV1Support)
+		if err != nil {
+			return "", fmt.Errorf("could not add to project: %w", err)
+		}
+		q.Set("projects", strings.Join(projectPaths, ","))
 	}
-	if len(milestones) > 0 {
-		q.Set("milestone", milestones[0])
+	if len(state.Milestones) > 0 {
+		q.Set("milestone", state.Milestones[0])
 	}
+
 	u.RawQuery = q.Encode()
 	return u.String(), nil
 }
 
-func AddMetadataToIssueParams(client *api.Client, baseRepo ghrepo.Interface, params map[string]interface{}, tb *IssueMetadataState) error {
+// Maximum length of a URL: 8192 bytes
+func ValidURL(urlStr string) bool {
+	return len(urlStr) < 8192
+}
+
+// Ensure that tb.MetadataResult object exists and contains enough pre-fetched API data to be able
+// to resolve all object listed in tb to GraphQL IDs.
+func fillMetadata(client *api.Client, baseRepo ghrepo.Interface, tb *IssueMetadataState, projectV1Support gh.ProjectsV1Support) error {
+	resolveInput := api.RepoResolveInput{}
+
+	if len(tb.Assignees) > 0 && (tb.MetadataResult == nil || len(tb.MetadataResult.AssignableUsers) == 0) {
+		resolveInput.Assignees = tb.Assignees
+	}
+
+	if len(tb.Reviewers) > 0 && (tb.MetadataResult == nil || len(tb.MetadataResult.AssignableUsers) == 0) {
+		resolveInput.Reviewers = tb.Reviewers
+	}
+
+	if len(tb.Labels) > 0 && (tb.MetadataResult == nil || len(tb.MetadataResult.Labels) == 0) {
+		resolveInput.Labels = tb.Labels
+	}
+
+	if len(tb.ProjectTitles) > 0 && (tb.MetadataResult == nil || len(tb.MetadataResult.Projects) == 0) {
+		if projectV1Support == gh.ProjectsV1Supported {
+			resolveInput.ProjectsV1 = true
+		}
+
+		resolveInput.ProjectsV2 = true
+	}
+
+	if len(tb.Milestones) > 0 && (tb.MetadataResult == nil || len(tb.MetadataResult.Milestones) == 0) {
+		resolveInput.Milestones = tb.Milestones
+	}
+
+	metadataResult, err := api.RepoResolveMetadataIDs(client, baseRepo, resolveInput)
+	if err != nil {
+		return err
+	}
+
+	if tb.MetadataResult == nil {
+		tb.MetadataResult = metadataResult
+	} else {
+		tb.MetadataResult.Merge(metadataResult)
+	}
+
+	return nil
+}
+
+func AddMetadataToIssueParams(client *api.Client, baseRepo ghrepo.Interface, params map[string]interface{}, tb *IssueMetadataState, projectV1Support gh.ProjectsV1Support) error {
 	if !tb.HasMetadata() {
 		return nil
 	}
 
-	if tb.MetadataResult == nil {
-		resolveInput := api.RepoResolveInput{
-			Reviewers:  tb.Reviewers,
-			Assignees:  tb.Assignees,
-			Labels:     tb.Labels,
-			Projects:   tb.Projects,
-			Milestones: tb.Milestones,
-		}
-
-		var err error
-		tb.MetadataResult, err = api.RepoResolveMetadataIDs(client, baseRepo, resolveInput)
-		if err != nil {
-			return err
-		}
+	if err := fillMetadata(client, baseRepo, tb, projectV1Support); err != nil {
+		return err
 	}
 
 	assigneeIDs, err := tb.MetadataResult.MembersToIDs(tb.Assignees)
@@ -70,11 +119,12 @@ func AddMetadataToIssueParams(client *api.Client, baseRepo ghrepo.Interface, par
 	}
 	params["labelIds"] = labelIDs
 
-	projectIDs, err := tb.MetadataResult.ProjectsToIDs(tb.Projects)
+	projectIDs, projectV2IDs, err := tb.MetadataResult.ProjectsTitlesToIDs(tb.ProjectTitles)
 	if err != nil {
 		return fmt.Errorf("could not add to project: %w", err)
 	}
 	params["projectIds"] = projectIDs
+	params["projectV2Ids"] = projectV2IDs
 
 	if len(tb.Milestones) > 0 {
 		milestoneID, err := tb.MetadataResult.MilestoneToID(tb.Milestones[0])
@@ -114,14 +164,50 @@ func AddMetadataToIssueParams(client *api.Client, baseRepo ghrepo.Interface, par
 }
 
 type FilterOptions struct {
-	Entity     string
-	State      string
 	Assignee   string
-	Labels     []string
 	Author     string
 	BaseBranch string
+	Draft      *bool
+	Entity     string
+	Fields     []string
+	HeadBranch string
+	Labels     []string
 	Mention    string
 	Milestone  string
+	Repo       string
+	Search     string
+	State      string
+}
+
+func (opts *FilterOptions) IsDefault() bool {
+	if opts.State != "open" {
+		return false
+	}
+	if len(opts.Labels) > 0 {
+		return false
+	}
+	if opts.Assignee != "" {
+		return false
+	}
+	if opts.Author != "" {
+		return false
+	}
+	if opts.BaseBranch != "" {
+		return false
+	}
+	if opts.HeadBranch != "" {
+		return false
+	}
+	if opts.Mention != "" {
+		return false
+	}
+	if opts.Milestone != "" {
+		return false
+	}
+	if opts.Search != "" {
+		return false
+	}
+	return true
 }
 
 func ListURLWithQuery(listURL string, options FilterOptions) (string, error) {
@@ -129,37 +215,123 @@ func ListURLWithQuery(listURL string, options FilterOptions) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	query := fmt.Sprintf("is:%s ", options.Entity)
-	if options.State != "all" {
-		query += fmt.Sprintf("is:%s ", options.State)
-	}
-	if options.Assignee != "" {
-		query += fmt.Sprintf("assignee:%s ", options.Assignee)
-	}
-	for _, label := range options.Labels {
-		query += fmt.Sprintf("label:%s ", quoteValueForQuery(label))
-	}
-	if options.Author != "" {
-		query += fmt.Sprintf("author:%s ", options.Author)
-	}
-	if options.BaseBranch != "" {
-		query += fmt.Sprintf("base:%s ", options.BaseBranch)
-	}
-	if options.Mention != "" {
-		query += fmt.Sprintf("mentions:%s ", options.Mention)
-	}
-	if options.Milestone != "" {
-		query += fmt.Sprintf("milestone:%s ", quoteValueForQuery(options.Milestone))
-	}
-	q := u.Query()
-	q.Set("q", strings.TrimSuffix(query, " "))
-	u.RawQuery = q.Encode()
+
+	params := u.Query()
+	params.Set("q", SearchQueryBuild(options))
+	u.RawQuery = params.Encode()
+
 	return u.String(), nil
 }
 
-func quoteValueForQuery(v string) string {
-	if strings.ContainsAny(v, " \"\t\r\n") {
-		return fmt.Sprintf("%q", v)
+func SearchQueryBuild(options FilterOptions) string {
+	var is, state string
+	switch options.State {
+	case "open", "closed":
+		state = options.State
+	case "merged":
+		is = "merged"
 	}
-	return v
+	q := search.Query{
+		Qualifiers: search.Qualifiers{
+			Assignee:  options.Assignee,
+			Author:    options.Author,
+			Base:      options.BaseBranch,
+			Draft:     options.Draft,
+			Head:      options.HeadBranch,
+			Label:     options.Labels,
+			Mentions:  options.Mention,
+			Milestone: options.Milestone,
+			Repo:      []string{options.Repo},
+			State:     state,
+			Is:        []string{is},
+			Type:      options.Entity,
+		},
+	}
+	if options.Search != "" {
+		return fmt.Sprintf("%s %s", options.Search, q.String())
+	}
+	return q.String()
+}
+
+func QueryHasStateClause(searchQuery string) bool {
+	argv, err := shlex.Split(searchQuery)
+	if err != nil {
+		return false
+	}
+
+	for _, arg := range argv {
+		if arg == "is:closed" || arg == "is:merged" || arg == "state:closed" || arg == "state:merged" || strings.HasPrefix(arg, "merged:") || strings.HasPrefix(arg, "closed:") {
+			return true
+		}
+	}
+
+	return false
+}
+
+// MeReplacer resolves usages of `@me` to the handle of the currently logged in user.
+type MeReplacer struct {
+	apiClient *api.Client
+	hostname  string
+	login     string
+}
+
+func NewMeReplacer(apiClient *api.Client, hostname string) *MeReplacer {
+	return &MeReplacer{
+		apiClient: apiClient,
+		hostname:  hostname,
+	}
+}
+
+func (r *MeReplacer) currentLogin() (string, error) {
+	if r.login != "" {
+		return r.login, nil
+	}
+	login, err := api.CurrentLoginName(r.apiClient, r.hostname)
+	if err != nil {
+		return "", fmt.Errorf("failed resolving `@me` to your user handle: %w", err)
+	}
+	r.login = login
+	return login, nil
+}
+
+func (r *MeReplacer) Replace(handle string) (string, error) {
+	if handle == "@me" {
+		return r.currentLogin()
+	}
+	return handle, nil
+}
+
+func (r *MeReplacer) ReplaceSlice(handles []string) ([]string, error) {
+	res := make([]string, len(handles))
+	for i, h := range handles {
+		var err error
+		res[i], err = r.Replace(h)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return res, nil
+}
+
+// CopilotReplacer resolves usages of `@copilot` to Copilot's login.
+type CopilotReplacer struct{}
+
+func NewCopilotReplacer() *CopilotReplacer {
+	return &CopilotReplacer{}
+}
+
+func (r *CopilotReplacer) replace(handle string) string {
+	if strings.EqualFold(handle, "@copilot") {
+		return api.CopilotActorLogin
+	}
+	return handle
+}
+
+// ReplaceSlice replaces usages of `@copilot` in a slice with Copilot's login.
+func (r *CopilotReplacer) ReplaceSlice(handles []string) []string {
+	res := make([]string, len(handles))
+	for i, h := range handles {
+		res[i] = r.replace(h)
+	}
+	return res
 }

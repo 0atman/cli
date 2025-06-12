@@ -2,19 +2,17 @@ package ready
 
 import (
 	"bytes"
-	"io/ioutil"
+	"io"
 	"net/http"
-	"regexp"
 	"testing"
 
-	"github.com/cli/cli/context"
-	"github.com/cli/cli/git"
-	"github.com/cli/cli/internal/config"
-	"github.com/cli/cli/internal/ghrepo"
-	"github.com/cli/cli/pkg/cmdutil"
-	"github.com/cli/cli/pkg/httpmock"
-	"github.com/cli/cli/pkg/iostreams"
-	"github.com/cli/cli/test"
+	"github.com/cli/cli/v2/api"
+	"github.com/cli/cli/v2/internal/ghrepo"
+	"github.com/cli/cli/v2/pkg/cmd/pr/shared"
+	"github.com/cli/cli/v2/pkg/cmdutil"
+	"github.com/cli/cli/v2/pkg/httpmock"
+	"github.com/cli/cli/v2/pkg/iostreams"
+	"github.com/cli/cli/v2/test"
 	"github.com/google/shlex"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -53,13 +51,13 @@ func Test_NewCmdReady(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			io, _, _, _ := iostreams.Test()
-			io.SetStdoutTTY(tt.isTTY)
-			io.SetStdinTTY(tt.isTTY)
-			io.SetStderrTTY(tt.isTTY)
+			ios, _, _, _ := iostreams.Test()
+			ios.SetStdoutTTY(tt.isTTY)
+			ios.SetStdinTTY(tt.isTTY)
+			ios.SetStderrTTY(tt.isTTY)
 
 			f := &cmdutil.Factory{
-				IOStreams: io,
+				IOStreams: ios,
 			}
 
 			var opts *ReadyOptions
@@ -74,8 +72,8 @@ func Test_NewCmdReady(t *testing.T) {
 			cmd.SetArgs(argv)
 
 			cmd.SetIn(&bytes.Buffer{})
-			cmd.SetOut(ioutil.Discard)
-			cmd.SetErr(ioutil.Discard)
+			cmd.SetOut(io.Discard)
+			cmd.SetErr(io.Discard)
 
 			_, err = cmd.ExecuteC()
 			if tt.wantErr != "" {
@@ -91,32 +89,15 @@ func Test_NewCmdReady(t *testing.T) {
 }
 
 func runCommand(rt http.RoundTripper, isTTY bool, cli string) (*test.CmdOut, error) {
-	io, _, stdout, stderr := iostreams.Test()
-	io.SetStdoutTTY(isTTY)
-	io.SetStdinTTY(isTTY)
-	io.SetStderrTTY(isTTY)
+	ios, _, stdout, stderr := iostreams.Test()
+	ios.SetStdoutTTY(isTTY)
+	ios.SetStdinTTY(isTTY)
+	ios.SetStderrTTY(isTTY)
 
 	factory := &cmdutil.Factory{
-		IOStreams: io,
+		IOStreams: ios,
 		HttpClient: func() (*http.Client, error) {
 			return &http.Client{Transport: rt}, nil
-		},
-		Config: func() (config.Config, error) {
-			return config.NewBlankConfig(), nil
-		},
-		BaseRepo: func() (ghrepo.Interface, error) {
-			return ghrepo.New("OWNER", "REPO"), nil
-		},
-		Remotes: func() (context.Remotes, error) {
-			return context.Remotes{
-				{
-					Remote: &git.Remote{Name: "origin"},
-					Repo:   ghrepo.New("OWNER", "REPO"),
-				},
-			}, nil
-		},
-		Branch: func() (string, error) {
-			return "main", nil
 		},
 	}
 
@@ -129,8 +110,8 @@ func runCommand(rt http.RoundTripper, isTTY bool, cli string) (*test.CmdOut, err
 	cmd.SetArgs(argv)
 
 	cmd.SetIn(&bytes.Buffer{})
-	cmd.SetOut(ioutil.Discard)
-	cmd.SetErr(ioutil.Discard)
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
 
 	_, err = cmd.ExecuteC()
 	return &test.CmdOut{
@@ -143,65 +124,99 @@ func TestPRReady(t *testing.T) {
 	http := &httpmock.Registry{}
 	defer http.Verify(t)
 
-	http.StubResponse(200, bytes.NewBufferString(`
-	{ "data": { "repository": {
-		"pullRequest": { "number": 444, "closed": false, "isDraft": true}
-	} } }
-	`))
-	http.StubResponse(200, bytes.NewBufferString(`{"id": "THE-ID"}`))
+	shared.StubFinderForRunCommandStyleTests(t, "123", &api.PullRequest{
+		ID:      "THE-ID",
+		Number:  123,
+		State:   "OPEN",
+		IsDraft: true,
+	}, ghrepo.New("OWNER", "REPO"))
 
-	output, err := runCommand(http, true, "444")
-	if err != nil {
-		t.Fatalf("error running command `pr ready`: %v", err)
-	}
+	http.Register(
+		httpmock.GraphQL(`mutation PullRequestReadyForReview\b`),
+		httpmock.GraphQLMutation(`{"id": "THE-ID"}`,
+			func(inputs map[string]interface{}) {
+				assert.Equal(t, inputs["pullRequestId"], "THE-ID")
+			}),
+	)
 
-	r := regexp.MustCompile(`Pull request #444 is marked as "ready for review"`)
-
-	if !r.MatchString(output.Stderr()) {
-		t.Fatalf("output did not match regexp /%s/\n> output\n%q\n", r, output.Stderr())
-	}
+	output, err := runCommand(http, true, "123")
+	assert.NoError(t, err)
+	assert.Equal(t, "", output.String())
+	assert.Equal(t, "✓ Pull request OWNER/REPO#123 is marked as \"ready for review\"\n", output.Stderr())
 }
 
 func TestPRReady_alreadyReady(t *testing.T) {
 	http := &httpmock.Registry{}
 	defer http.Verify(t)
 
-	http.StubResponse(200, bytes.NewBufferString(`
-	{ "data": { "repository": {
-		"pullRequest": { "number": 445, "closed": false, "isDraft": false}
-	} } }
-	`))
+	shared.StubFinderForRunCommandStyleTests(t, "123", &api.PullRequest{
+		ID:      "THE-ID",
+		Number:  123,
+		State:   "OPEN",
+		IsDraft: false,
+	}, ghrepo.New("OWNER", "REPO"))
 
-	output, err := runCommand(http, true, "445")
-	if err != nil {
-		t.Fatalf("error running command `pr ready`: %v", err)
-	}
+	output, err := runCommand(http, true, "123")
+	assert.NoError(t, err)
+	assert.Equal(t, "", output.String())
+	assert.Equal(t, "! Pull request OWNER/REPO#123 is already \"ready for review\"\n", output.Stderr())
+}
 
-	r := regexp.MustCompile(`Pull request #445 is already "ready for review"`)
+func TestPRReadyUndo(t *testing.T) {
+	http := &httpmock.Registry{}
+	defer http.Verify(t)
 
-	if !r.MatchString(output.Stderr()) {
-		t.Fatalf("output did not match regexp /%s/\n> output\n%q\n", r, output.Stderr())
-	}
+	shared.StubFinderForRunCommandStyleTests(t, "123", &api.PullRequest{
+		ID:      "THE-ID",
+		Number:  123,
+		State:   "OPEN",
+		IsDraft: false,
+	}, ghrepo.New("OWNER", "REPO"))
+
+	http.Register(
+		httpmock.GraphQL(`mutation ConvertPullRequestToDraft\b`),
+		httpmock.GraphQLMutation(`{"id": "THE-ID"}`,
+			func(inputs map[string]interface{}) {
+				assert.Equal(t, inputs["pullRequestId"], "THE-ID")
+			}),
+	)
+
+	output, err := runCommand(http, true, "123 --undo")
+	assert.NoError(t, err)
+	assert.Equal(t, "", output.String())
+	assert.Equal(t, "✓ Pull request OWNER/REPO#123 is converted to \"draft\"\n", output.Stderr())
+}
+
+func TestPRReadyUndo_alreadyDraft(t *testing.T) {
+	http := &httpmock.Registry{}
+	defer http.Verify(t)
+
+	shared.StubFinderForRunCommandStyleTests(t, "123", &api.PullRequest{
+		ID:      "THE-ID",
+		Number:  123,
+		State:   "OPEN",
+		IsDraft: true,
+	}, ghrepo.New("OWNER", "REPO"))
+
+	output, err := runCommand(http, true, "123 --undo")
+	assert.NoError(t, err)
+	assert.Equal(t, "", output.String())
+	assert.Equal(t, "! Pull request OWNER/REPO#123 is already \"in draft\"\n", output.Stderr())
 }
 
 func TestPRReady_closed(t *testing.T) {
 	http := &httpmock.Registry{}
 	defer http.Verify(t)
 
-	http.StubResponse(200, bytes.NewBufferString(`
-	{ "data": { "repository": {
-		"pullRequest": { "number": 446, "closed": true, "isDraft": true}
-	} } }
-	`))
+	shared.StubFinderForRunCommandStyleTests(t, "123", &api.PullRequest{
+		ID:      "THE-ID",
+		Number:  123,
+		State:   "CLOSED",
+		IsDraft: true,
+	}, ghrepo.New("OWNER", "REPO"))
 
-	output, err := runCommand(http, true, "446")
-	if err == nil {
-		t.Fatalf("expected an error running command `pr ready` on a review that is closed!: %v", err)
-	}
-
-	r := regexp.MustCompile(`Pull request #446 is closed. Only draft pull requests can be marked as "ready for review"`)
-
-	if !r.MatchString(output.Stderr()) {
-		t.Fatalf("output did not match regexp /%s/\n> output\n%q\n", r, output.Stderr())
-	}
+	output, err := runCommand(http, true, "123")
+	assert.EqualError(t, err, "SilentError")
+	assert.Equal(t, "", output.String())
+	assert.Equal(t, "X Pull request OWNER/REPO#123 is closed. Only draft pull requests can be marked as \"ready for review\"\n", output.Stderr())
 }

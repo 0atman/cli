@@ -2,7 +2,7 @@ package api
 
 import (
 	"bytes"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"testing"
 
@@ -126,7 +126,43 @@ func Test_httpRequest(t *testing.T) {
 				method:  "GET",
 				u:       "https://api.github.com/repos/octocat/spoon-knife",
 				body:    "",
-				headers: "",
+				headers: "Accept: */*\r\n",
+			},
+		},
+		{
+			name: "GET with accept header",
+			args: args{
+				client:  &httpClient,
+				host:    "github.com",
+				method:  "GET",
+				p:       "repos/octocat/spoon-knife",
+				params:  nil,
+				headers: []string{"Accept: testing"},
+			},
+			wantErr: false,
+			want: expects{
+				method:  "GET",
+				u:       "https://api.github.com/repos/octocat/spoon-knife",
+				body:    "",
+				headers: "Accept: testing\r\n",
+			},
+		},
+		{
+			name: "lowercase HTTP method",
+			args: args{
+				client:  &httpClient,
+				host:    "github.com",
+				method:  "get",
+				p:       "repos/octocat/spoon-knife",
+				params:  nil,
+				headers: []string{},
+			},
+			wantErr: false,
+			want: expects{
+				method:  "GET",
+				u:       "https://api.github.com/repos/octocat/spoon-knife",
+				body:    "",
+				headers: "Accept: */*\r\n",
 			},
 		},
 		{
@@ -144,7 +180,7 @@ func Test_httpRequest(t *testing.T) {
 				method:  "GET",
 				u:       "https://api.github.com/repos/octocat/spoon-knife",
 				body:    "",
-				headers: "",
+				headers: "Accept: */*\r\n",
 			},
 		},
 		{
@@ -162,7 +198,7 @@ func Test_httpRequest(t *testing.T) {
 				method:  "GET",
 				u:       "https://example.org/api/v3/repos/octocat/spoon-knife",
 				body:    "",
-				headers: "",
+				headers: "Accept: */*\r\n",
 			},
 		},
 		{
@@ -182,7 +218,7 @@ func Test_httpRequest(t *testing.T) {
 				method:  "GET",
 				u:       "https://api.github.com/repos/octocat/spoon-knife?a=b",
 				body:    "",
-				headers: "",
+				headers: "Accept: */*\r\n",
 			},
 		},
 		{
@@ -202,7 +238,7 @@ func Test_httpRequest(t *testing.T) {
 				method:  "POST",
 				u:       "https://api.github.com/repos",
 				body:    `{"a":"b"}`,
-				headers: "Content-Type: application/json; charset=utf-8\r\n",
+				headers: "Accept: */*\r\nContent-Type: application/json; charset=utf-8\r\n",
 			},
 		},
 		{
@@ -213,7 +249,7 @@ func Test_httpRequest(t *testing.T) {
 				method: "POST",
 				p:      "graphql",
 				params: map[string]interface{}{
-					"a": []byte("b"),
+					"a": "b",
 				},
 				headers: []string{},
 			},
@@ -222,7 +258,7 @@ func Test_httpRequest(t *testing.T) {
 				method:  "POST",
 				u:       "https://api.github.com/graphql",
 				body:    `{"variables":{"a":"b"}}`,
-				headers: "Content-Type: application/json; charset=utf-8\r\n",
+				headers: "Accept: */*\r\nContent-Type: application/json; charset=utf-8\r\n",
 			},
 		},
 		{
@@ -240,7 +276,7 @@ func Test_httpRequest(t *testing.T) {
 				method:  "POST",
 				u:       "https://example.org/api/graphql",
 				body:    `{}`,
-				headers: "Content-Type: application/json; charset=utf-8\r\n",
+				headers: "Accept: */*\r\nContent-Type: application/json; charset=utf-8\r\n",
 			},
 		},
 		{
@@ -281,7 +317,7 @@ func Test_httpRequest(t *testing.T) {
 			}
 
 			if tt.want.body != "" {
-				bb, err := ioutil.ReadAll(req.Body)
+				bb, err := io.ReadAll(req.Body)
 				if err != nil {
 					t.Errorf("Request.Body ReadAll error = %v", err)
 					return
@@ -321,6 +357,14 @@ func Test_addQuery(t *testing.T) {
 				params: map[string]interface{}{"a": "hello"},
 			},
 			want: "?a=hello",
+		},
+		{
+			name: "array",
+			args: args{
+				path:   "",
+				params: map[string]interface{}{"a": []interface{}{"hello", "world"}},
+			},
+			want: "?a%5B%5D=hello&a%5B%5D=world",
 		},
 		{
 			name: "append",

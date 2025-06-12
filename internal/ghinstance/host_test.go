@@ -2,97 +2,88 @@ package ghinstance
 
 import (
 	"testing"
+
+	"github.com/stretchr/testify/assert"
 )
 
-func TestOverridableDefault(t *testing.T) {
-	oldOverride := hostnameOverride
-	t.Cleanup(func() {
-		hostnameOverride = oldOverride
-	})
-
-	host := OverridableDefault()
-	if host != "github.com" {
-		t.Errorf("expected github.com, got %q", host)
-	}
-
-	OverrideDefault("example.org")
-
-	host = OverridableDefault()
-	if host != "example.org" {
-		t.Errorf("expected example.org, got %q", host)
-	}
-	host = Default()
-	if host != "github.com" {
-		t.Errorf("expected github.com, got %q", host)
-	}
-}
-
-func TestIsEnterprise(t *testing.T) {
+func TestTenantName(t *testing.T) {
 	tests := []struct {
-		host string
-		want bool
+		host       string
+		wantTenant string
+		wantFound  bool
 	}{
 		{
-			host: "github.com",
-			want: false,
+			host:       "github.com",
+			wantTenant: "github.com",
 		},
 		{
-			host: "api.github.com",
-			want: false,
+			host:       "github.localhost",
+			wantTenant: "github.localhost",
 		},
 		{
-			host: "ghe.io",
-			want: true,
+			host:       "garage.github.com",
+			wantTenant: "github.com",
 		},
 		{
-			host: "example.com",
-			want: true,
+			host:       "ghe.com",
+			wantTenant: "ghe.com",
+		},
+		{
+			host:       "tenant.ghe.com",
+			wantTenant: "tenant",
+			wantFound:  true,
+		},
+		{
+			host:       "api.tenant.ghe.com",
+			wantTenant: "tenant",
+			wantFound:  true,
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.host, func(t *testing.T) {
-			if got := IsEnterprise(tt.host); got != tt.want {
-				t.Errorf("IsEnterprise() = %v, want %v", got, tt.want)
+			if tenant, found := TenantName(tt.host); tenant != tt.wantTenant || found != tt.wantFound {
+				t.Errorf("TenantName(%v) = %v %v, want %v %v", tt.host, tenant, found, tt.wantTenant, tt.wantFound)
 			}
 		})
 	}
 }
 
-func TestNormalizeHostname(t *testing.T) {
+func TestHostnameValidator(t *testing.T) {
 	tests := []struct {
-		host string
-		want string
+		name     string
+		input    string
+		wantsErr bool
 	}{
 		{
-			host: "GitHub.com",
-			want: "github.com",
+			name:     "valid hostname",
+			input:    "internal.instance",
+			wantsErr: false,
 		},
 		{
-			host: "api.github.com",
-			want: "github.com",
+			name:     "hostname with slashes",
+			input:    "//internal.instance",
+			wantsErr: true,
 		},
 		{
-			host: "ssh.github.com",
-			want: "github.com",
+			name:     "empty hostname",
+			input:    "   ",
+			wantsErr: true,
 		},
 		{
-			host: "upload.github.com",
-			want: "github.com",
-		},
-		{
-			host: "GHE.IO",
-			want: "ghe.io",
-		},
-		{
-			host: "git.my.org",
-			want: "git.my.org",
+			name:     "hostname with colon",
+			input:    "internal.instance:2205",
+			wantsErr: true,
 		},
 	}
+
 	for _, tt := range tests {
-		t.Run(tt.host, func(t *testing.T) {
-			if got := NormalizeHostname(tt.host); got != tt.want {
-				t.Errorf("NormalizeHostname() = %v, want %v", got, tt.want)
+		t.Run(tt.name, func(t *testing.T) {
+			err := HostnameValidator(tt.input)
+			if tt.wantsErr {
+				assert.Error(t, err)
+				return
 			}
+			assert.NoError(t, err)
 		})
 	}
 }
@@ -107,8 +98,20 @@ func TestGraphQLEndpoint(t *testing.T) {
 			want: "https://api.github.com/graphql",
 		},
 		{
+			host: "github.localhost",
+			want: "http://api.github.localhost/graphql",
+		},
+		{
+			host: "garage.github.com",
+			want: "https://garage.github.com/api/graphql",
+		},
+		{
 			host: "ghe.io",
 			want: "https://ghe.io/api/graphql",
+		},
+		{
+			host: "tenant.ghe.com",
+			want: "https://api.tenant.ghe.com/graphql",
 		},
 	}
 	for _, tt := range tests {
@@ -130,8 +133,20 @@ func TestRESTPrefix(t *testing.T) {
 			want: "https://api.github.com/",
 		},
 		{
+			host: "github.localhost",
+			want: "http://api.github.localhost/",
+		},
+		{
+			host: "garage.github.com",
+			want: "https://garage.github.com/api/v3/",
+		},
+		{
 			host: "ghe.io",
 			want: "https://ghe.io/api/v3/",
+		},
+		{
+			host: "tenant.ghe.com",
+			want: "https://api.tenant.ghe.com/",
 		},
 	}
 	for _, tt := range tests {

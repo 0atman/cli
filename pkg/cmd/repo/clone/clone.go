@@ -1,36 +1,39 @@
 package clone
 
 import (
+	"context"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/MakeNowJust/heredoc"
-	"github.com/cli/cli/api"
-	"github.com/cli/cli/git"
-	"github.com/cli/cli/internal/config"
-	"github.com/cli/cli/internal/ghinstance"
-	"github.com/cli/cli/internal/ghrepo"
-	"github.com/cli/cli/pkg/cmdutil"
-	"github.com/cli/cli/pkg/iostreams"
+	"github.com/cli/cli/v2/api"
+	"github.com/cli/cli/v2/git"
+	"github.com/cli/cli/v2/internal/gh"
+	"github.com/cli/cli/v2/internal/ghrepo"
+	"github.com/cli/cli/v2/pkg/cmdutil"
+	"github.com/cli/cli/v2/pkg/iostreams"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 )
 
 type CloneOptions struct {
 	HttpClient func() (*http.Client, error)
-	Config     func() (config.Config, error)
+	GitClient  *git.Client
+	Config     func() (gh.Config, error)
 	IO         *iostreams.IOStreams
 
-	GitArgs    []string
-	Directory  string
-	Repository string
+	GitArgs      []string
+	Repository   string
+	UpstreamName string
 }
 
 func NewCmdClone(f *cmdutil.Factory, runF func(*CloneOptions) error) *cobra.Command {
 	opts := &CloneOptions{
 		IO:         f.IOStreams,
 		HttpClient: f.HttpClient,
+		GitClient:  f.GitClient,
 		Config:     f.Config,
 	}
 
@@ -38,15 +41,42 @@ func NewCmdClone(f *cmdutil.Factory, runF func(*CloneOptions) error) *cobra.Comm
 		DisableFlagsInUseLine: true,
 
 		Use:   "clone <repository> [<directory>] [-- <gitflags>...]",
-		Args:  cobra.MinimumNArgs(1),
+		Args:  cmdutil.MinimumArgs(1, "cannot clone: repository argument required"),
 		Short: "Clone a repository locally",
-		Long: heredoc.Doc(`
-			Clone a GitHub repository locally.
+		Long: heredoc.Docf(`
+			Clone a GitHub repository locally. Pass additional %[1]sgit clone%[1]s flags by listing
+			them after %[1]s--%[1]s.
 
-			If the "OWNER/" portion of the "OWNER/REPO" repository argument is omitted, it
+			If the %[1]sOWNER/%[1]s portion of the %[1]sOWNER/REPO%[1]s repository argument is omitted, it
 			defaults to the name of the authenticating user.
-			
-			Pass additional 'git clone' flags by listing them after '--'.
+
+			When a protocol scheme is not provided in the repository argument, the %[1]sgit_protocol%[1]s will be
+			chosen from your configuration, which can be checked via %[1]sgh config get git_protocol%[1]s. If the protocol
+			scheme is provided, the repository will be cloned using the specified protocol.
+
+			If the repository is a fork, its parent repository will be added as an additional
+			git remote called %[1]supstream%[1]s. The remote name can be configured using %[1]s--upstream-remote-name%[1]s.
+			The %[1]s--upstream-remote-name%[1]s option supports an %[1]s@owner%[1]s value which will name
+			the remote after the owner of the parent repository.
+
+			If the repository is a fork, its parent repository will be set as the default remote repository.
+		`, "`"),
+		Example: heredoc.Doc(`
+			# Clone a repository from a specific org
+			$ gh repo clone cli/cli
+
+			# Clone a repository from your own account
+			$ gh repo clone myrepo
+
+			# Clone a repo, overriding git protocol configuration
+			$ gh repo clone https://github.com/cli/cli
+			$ gh repo clone git@github.com:cli/cli.git
+
+			# Clone a repository to a custom directory
+			$ gh repo clone cli/cli workspace/cli
+
+			# Clone a repository with additional git clone flags
+			$ gh repo clone cli/cli -- --depth=1
 		`),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			opts.Repository = args[0]
@@ -60,11 +90,12 @@ func NewCmdClone(f *cmdutil.Factory, runF func(*CloneOptions) error) *cobra.Comm
 		},
 	}
 
+	cmd.Flags().StringVarP(&opts.UpstreamName, "upstream-remote-name", "u", "upstream", "Upstream remote name when cloning a fork")
 	cmd.SetFlagErrorFunc(func(cmd *cobra.Command, err error) error {
 		if err == pflag.ErrHelp {
 			return err
 		}
-		return &cmdutil.FlagError{Err: fmt.Errorf("%w\nSeparate git clone flags with '--'.", err)}
+		return cmdutil.FlagErrorf("%w\nSeparate git clone flags with '--'.", err)
 	})
 
 	return cmd
@@ -82,60 +113,139 @@ func cloneRun(opts *CloneOptions) error {
 	}
 
 	apiClient := api.NewClientFromHTTP(httpClient)
-	cloneURL := opts.Repository
-	if !strings.Contains(cloneURL, ":") {
-		if !strings.Contains(cloneURL, "/") {
-			currentUser, err := api.CurrentLoginName(apiClient, ghinstance.OverridableDefault())
+
+	repositoryIsURL := strings.Contains(opts.Repository, ":")
+	repositoryIsFullName := !repositoryIsURL && strings.Contains(opts.Repository, "/")
+
+	var repo ghrepo.Interface
+	var protocol string
+
+	if repositoryIsURL {
+		initialURL, err := git.ParseURL(opts.Repository)
+		if err != nil {
+			return err
+		}
+
+		repoURL := simplifyURL(initialURL)
+		repo, err = ghrepo.FromURL(repoURL)
+		if err != nil {
+			return err
+		}
+		if repoURL.Scheme == "git+ssh" {
+			repoURL.Scheme = "ssh"
+		}
+		protocol = repoURL.Scheme
+	} else {
+		var fullName string
+		if repositoryIsFullName {
+			fullName = opts.Repository
+		} else {
+			host, _ := cfg.Authentication().DefaultHost()
+			currentUser, err := api.CurrentLoginName(apiClient, host)
 			if err != nil {
 				return err
 			}
-			cloneURL = currentUser + "/" + cloneURL
+			fullName = currentUser + "/" + opts.Repository
 		}
-		repo, err := ghrepo.FromFullName(cloneURL)
+
+		repo, err = ghrepo.FromFullName(fullName)
 		if err != nil {
 			return err
 		}
 
-		protocol, err := cfg.Get(repo.RepoHost(), "git_protocol")
-		if err != nil {
-			return err
+		protocol = cfg.GitProtocol(repo.RepoHost()).Value
+	}
+
+	wantsWiki := strings.HasSuffix(repo.RepoName(), ".wiki")
+	if wantsWiki {
+		repoName := strings.TrimSuffix(repo.RepoName(), ".wiki")
+		repo = ghrepo.NewWithHost(repo.RepoOwner(), repoName, repo.RepoHost())
+	}
+
+	// Load the repo from the API to get the username/repo name in its
+	// canonical capitalization
+	canonicalRepo, err := api.GitHubRepo(apiClient, repo)
+	if err != nil {
+		return err
+	}
+	canonicalCloneURL := ghrepo.FormatRemoteURL(canonicalRepo, protocol)
+
+	// If repo HasWikiEnabled and wantsWiki is true then create a new clone URL
+	if wantsWiki {
+		if !canonicalRepo.HasWikiEnabled {
+			return fmt.Errorf("The '%s' repository does not have a wiki", ghrepo.FullName(canonicalRepo))
 		}
-		cloneURL = ghrepo.FormatRemoteURL(repo, protocol)
+		canonicalCloneURL = strings.TrimSuffix(canonicalCloneURL, ".git") + ".wiki.git"
 	}
 
-	var repo ghrepo.Interface
-	var parentRepo ghrepo.Interface
-
-	// TODO: consider caching and reusing `git.ParseSSHConfig().Translator()`
-	// here to handle hostname aliases in SSH remotes
-	if u, err := git.ParseURL(cloneURL); err == nil {
-		repo, _ = ghrepo.FromURL(u)
-	}
-
-	if repo != nil {
-		parentRepo, err = api.RepoParent(apiClient, repo)
-		if err != nil {
-			return err
-		}
-	}
-
-	cloneDir, err := git.RunClone(cloneURL, opts.GitArgs)
+	gitClient := opts.GitClient
+	ctx := context.Background()
+	cloneDir, err := gitClient.Clone(ctx, canonicalCloneURL, opts.GitArgs)
 	if err != nil {
 		return err
 	}
 
-	if parentRepo != nil {
-		protocol, err := cfg.Get(parentRepo.RepoHost(), "git_protocol")
-		if err != nil {
+	// If the repo is a fork, add the parent as an upstream remote and set the parent as the default repo.
+	if canonicalRepo.Parent != nil {
+		protocol := cfg.GitProtocol(canonicalRepo.Parent.RepoHost()).Value
+		upstreamURL := ghrepo.FormatRemoteURL(canonicalRepo.Parent, protocol)
+
+		upstreamName := opts.UpstreamName
+		if opts.UpstreamName == "@owner" {
+			upstreamName = canonicalRepo.Parent.RepoOwner()
+		}
+
+		gc := gitClient.Copy()
+		gc.RepoDir = cloneDir
+
+		if _, err := gc.AddRemote(ctx, upstreamName, upstreamURL, []string{canonicalRepo.Parent.DefaultBranchRef.Name}); err != nil {
 			return err
 		}
-		upstreamURL := ghrepo.FormatRemoteURL(parentRepo, protocol)
 
-		err = git.AddUpstreamRemote(upstreamURL, cloneDir)
-		if err != nil {
+		if err := gc.Fetch(ctx, upstreamName, ""); err != nil {
 			return err
+		}
+
+		if err := gc.SetRemoteBranches(ctx, upstreamName, `*`); err != nil {
+			return err
+		}
+
+		if err = gc.SetRemoteResolution(ctx, upstreamName, "base"); err != nil {
+			return err
+		}
+
+		connectedToTerminal := opts.IO.IsStdoutTTY()
+		if connectedToTerminal {
+			cs := opts.IO.ColorScheme()
+			fmt.Fprintf(opts.IO.ErrOut, "%s Repository %s set as the default repository. To learn more about the default repository, run: gh repo set-default --help\n", cs.WarningIcon(), cs.Bold(ghrepo.FullName(canonicalRepo.Parent)))
 		}
 	}
-
 	return nil
+}
+
+// simplifyURL strips given URL of extra parts like extra path segments (i.e.,
+// anything beyond `/owner/repo`), query strings, or fragments. This function
+// never returns an error.
+//
+// The rationale behind this function is to let users clone a repo with any
+// URL related to the repo; like:
+//   - (Tree)              github.com/owner/repo/blob/main/foo/bar
+//   - (Deep-link to line) github.com/owner/repo/blob/main/foo/bar#L168
+//   - (Issue/PR comment)  github.com/owner/repo/pull/999#issue-9999999999
+//   - (Commit history)    github.com/owner/repo/commits/main/?author=foo
+func simplifyURL(u *url.URL) *url.URL {
+	result := &url.URL{
+		Scheme: u.Scheme,
+		User:   u.User,
+		Host:   u.Host,
+		Path:   u.Path,
+	}
+
+	pathParts := strings.SplitN(strings.Trim(u.Path, "/"), "/", 3)
+	if len(pathParts) <= 2 {
+		return result
+	}
+
+	result.Path = strings.Join(pathParts[0:2], "/")
+	return result
 }

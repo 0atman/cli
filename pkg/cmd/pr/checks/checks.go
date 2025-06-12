@@ -4,48 +4,102 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"sort"
 	"time"
 
-	"github.com/cli/cli/api"
-	"github.com/cli/cli/context"
-	"github.com/cli/cli/internal/ghrepo"
-	"github.com/cli/cli/pkg/cmd/pr/shared"
-	"github.com/cli/cli/pkg/cmdutil"
-	"github.com/cli/cli/pkg/iostreams"
-	"github.com/cli/cli/utils"
+	"github.com/MakeNowJust/heredoc"
+	"github.com/cli/cli/v2/api"
+	"github.com/cli/cli/v2/internal/browser"
+	fd "github.com/cli/cli/v2/internal/featuredetection"
+	"github.com/cli/cli/v2/internal/ghrepo"
+	"github.com/cli/cli/v2/internal/text"
+	"github.com/cli/cli/v2/pkg/cmd/pr/shared"
+	"github.com/cli/cli/v2/pkg/cmdutil"
+	"github.com/cli/cli/v2/pkg/iostreams"
 	"github.com/spf13/cobra"
 )
+
+const defaultInterval time.Duration = 10 * time.Second
+
+var prCheckFields = []string{
+	"name",
+	"state",
+	"startedAt",
+	"completedAt",
+	"link",
+	"bucket",
+	"event",
+	"workflow",
+	"description",
+}
 
 type ChecksOptions struct {
 	HttpClient func() (*http.Client, error)
 	IO         *iostreams.IOStreams
-	BaseRepo   func() (ghrepo.Interface, error)
-	Branch     func() (string, error)
-	Remotes    func() (context.Remotes, error)
+	Browser    browser.Browser
+	Exporter   cmdutil.Exporter
+
+	Finder   shared.PRFinder
+	Detector fd.Detector
 
 	SelectorArg string
+	WebMode     bool
+	Interval    time.Duration
+	Watch       bool
+	FailFast    bool
+	Required    bool
 }
 
 func NewCmdChecks(f *cmdutil.Factory, runF func(*ChecksOptions) error) *cobra.Command {
+	var interval int
 	opts := &ChecksOptions{
-		IO:         f.IOStreams,
 		HttpClient: f.HttpClient,
-		Branch:     f.Branch,
-		Remotes:    f.Remotes,
-		BaseRepo:   f.BaseRepo,
+		IO:         f.IOStreams,
+		Browser:    f.Browser,
+		Interval:   defaultInterval,
 	}
 
 	cmd := &cobra.Command{
-		Use:   "checks",
+		Use:   "checks [<number> | <url> | <branch>]",
 		Short: "Show CI status for a single pull request",
-		Args:  cobra.MaximumNArgs(1),
+		Long: heredoc.Docf(`
+			Show CI status for a single pull request.
+
+			Without an argument, the pull request that belongs to the current branch
+			is selected.
+
+			When the %[1]s--json%[1]s flag is used, it includes a %[1]sbucket%[1]s field, which categorizes
+			the %[1]sstate%[1]s field into %[1]spass%[1]s, %[1]sfail%[1]s, %[1]spending%[1]s, %[1]sskipping%[1]s, or %[1]scancel%[1]s.
+
+			Additional exit codes:
+				8: Checks pending
+		`, "`"),
+		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			// support `-R, --repo` override
-			opts.BaseRepo = f.BaseRepo
+			opts.Finder = shared.NewFinder(f)
+
+			if opts.Exporter != nil && opts.Watch {
+				return cmdutil.FlagErrorf("cannot use `--watch` with `--json` flag")
+			}
 
 			if repoOverride, _ := cmd.Flags().GetString("repo"); repoOverride != "" && len(args) == 0 {
-				return &cmdutil.FlagError{Err: errors.New("argument required when using the --repo flag")}
+				return cmdutil.FlagErrorf("argument required when using the `--repo` flag")
+			}
+
+			if opts.FailFast && !opts.Watch {
+				return cmdutil.FlagErrorf("cannot use `--fail-fast` flag without `--watch` flag")
+			}
+
+			intervalChanged := cmd.Flags().Changed("interval")
+			if !opts.Watch && intervalChanged {
+				return cmdutil.FlagErrorf("cannot use `--interval` flag without `--watch` flag")
+			}
+
+			if intervalChanged {
+				var err error
+				opts.Interval, err = time.ParseDuration(fmt.Sprintf("%ds", interval))
+				if err != nil {
+					return cmdutil.FlagErrorf("could not parse `--interval` flag: %w", err)
+				}
 			}
 
 			if len(args) > 0 {
@@ -60,168 +114,198 @@ func NewCmdChecks(f *cmdutil.Factory, runF func(*ChecksOptions) error) *cobra.Co
 		},
 	}
 
+	cmd.Flags().BoolVarP(&opts.WebMode, "web", "w", false, "Open the web browser to show details about checks")
+	cmd.Flags().BoolVarP(&opts.Watch, "watch", "", false, "Watch checks until they finish")
+	cmd.Flags().BoolVarP(&opts.FailFast, "fail-fast", "", false, "Exit watch mode on first check failure")
+	cmd.Flags().IntVarP(&interval, "interval", "i", 10, "Refresh interval in seconds when using `--watch` flag")
+	cmd.Flags().BoolVar(&opts.Required, "required", false, "Only show checks that are required")
+
+	cmdutil.AddJSONFlags(cmd, &opts.Exporter, prCheckFields)
+
 	return cmd
 }
 
+func checksRunWebMode(opts *ChecksOptions) error {
+	findOptions := shared.FindOptions{
+		Selector: opts.SelectorArg,
+		Fields:   []string{"number"},
+	}
+	pr, baseRepo, err := opts.Finder.Find(findOptions)
+	if err != nil {
+		return err
+	}
+
+	isTerminal := opts.IO.IsStdoutTTY()
+	openURL := ghrepo.GenerateRepoURL(baseRepo, "pull/%d/checks", pr.Number)
+
+	if isTerminal {
+		fmt.Fprintf(opts.IO.ErrOut, "Opening %s in your browser.\n", text.DisplayURL(openURL))
+	}
+
+	return opts.Browser.Browse(openURL)
+}
+
 func checksRun(opts *ChecksOptions) error {
-	httpClient, err := opts.HttpClient()
+	if opts.WebMode {
+		return checksRunWebMode(opts)
+	}
+
+	findOptions := shared.FindOptions{
+		Selector: opts.SelectorArg,
+		Fields:   []string{"number", "headRefName"},
+	}
+
+	var pr *api.PullRequest
+	pr, repo, findErr := opts.Finder.Find(findOptions)
+	if findErr != nil {
+		return findErr
+	}
+
+	client, clientErr := opts.HttpClient()
+	if clientErr != nil {
+		return clientErr
+	}
+
+	var checks []check
+	var counts checkCounts
+	var err error
+	var includeEvent bool
+
+	if opts.Detector == nil {
+		cachedClient := api.NewCachedHTTPClient(client, time.Hour*24)
+		opts.Detector = fd.NewDetector(cachedClient, repo.RepoHost())
+	}
+	if features, featuresErr := opts.Detector.PullRequestFeatures(); featuresErr != nil {
+		return featuresErr
+	} else {
+		includeEvent = features.CheckRunEvent
+	}
+
+	checks, counts, err = populateStatusChecks(client, repo, pr, opts.Required, includeEvent)
 	if err != nil {
 		return err
 	}
-	apiClient := api.NewClientFromHTTP(httpClient)
 
-	pr, _, err := shared.PRFromArgs(apiClient, opts.BaseRepo, opts.Branch, opts.Remotes, opts.SelectorArg)
-	if err != nil {
-		return err
+	if opts.Exporter != nil {
+		return opts.Exporter.Write(opts.IO, checks)
 	}
 
-	if len(pr.Commits.Nodes) == 0 {
-		return nil
-	}
-
-	rollup := pr.Commits.Nodes[0].Commit.StatusCheckRollup.Contexts.Nodes
-	if len(rollup) == 0 {
-		return nil
-	}
-
-	passing := 0
-	failing := 0
-	pending := 0
-
-	type output struct {
-		mark      string
-		bucket    string
-		name      string
-		elapsed   string
-		link      string
-		markColor func(string) string
-	}
-
-	outputs := []output{}
-
-	for _, c := range pr.Commits.Nodes[0].Commit.StatusCheckRollup.Contexts.Nodes {
-		mark := "✓"
-		bucket := "pass"
-		state := c.State
-		markColor := utils.Green
-		if state == "" {
-			if c.Status == "COMPLETED" {
-				state = c.Conclusion
-			} else {
-				state = c.Status
-			}
-		}
-		switch state {
-		case "SUCCESS", "NEUTRAL", "SKIPPED":
-			passing++
-		case "ERROR", "FAILURE", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED":
-			mark = "X"
-			markColor = utils.Red
-			failing++
-			bucket = "fail"
-		case "EXPECTED", "REQUESTED", "QUEUED", "PENDING", "IN_PROGRESS", "STALE":
-			mark = "-"
-			markColor = utils.Yellow
-			pending++
-			bucket = "pending"
-		default:
-			panic(fmt.Errorf("unsupported status: %q", state))
-		}
-
-		elapsed := ""
-		zeroTime := time.Time{}
-
-		if c.StartedAt != zeroTime && c.CompletedAt != zeroTime {
-			e := c.CompletedAt.Sub(c.StartedAt)
-			if e > 0 {
-				elapsed = e.String()
-			}
-		}
-
-		link := c.DetailsURL
-		if link == "" {
-			link = c.TargetURL
-		}
-
-		name := c.Name
-		if name == "" {
-			name = c.Context
-		}
-
-		outputs = append(outputs, output{mark, bucket, name, elapsed, link, markColor})
-	}
-
-	sort.Slice(outputs, func(i, j int) bool {
-		b0 := outputs[i].bucket
-		n0 := outputs[i].name
-		l0 := outputs[i].link
-		b1 := outputs[j].bucket
-		n1 := outputs[j].name
-		l1 := outputs[j].link
-
-		if b0 == b1 {
-			if n0 == n1 {
-				return l0 < l1
-			} else {
-				return n0 < n1
-			}
-		}
-
-		return (b0 == "fail") || (b0 == "pending" && b1 == "success")
-	})
-
-	tp := utils.NewTablePrinter(opts.IO)
-
-	for _, o := range outputs {
-		if opts.IO.IsStdoutTTY() {
-			tp.AddField(o.mark, nil, o.markColor)
-			tp.AddField(o.name, nil, nil)
-			tp.AddField(o.elapsed, nil, nil)
-			tp.AddField(o.link, nil, nil)
+	if opts.Watch {
+		opts.IO.StartAlternateScreenBuffer()
+	} else {
+		// Only start pager in non-watch mode
+		if err := opts.IO.StartPager(); err == nil {
+			defer opts.IO.StopPager()
 		} else {
-			tp.AddField(o.name, nil, nil)
-			tp.AddField(o.bucket, nil, nil)
-			if o.elapsed == "" {
-				tp.AddField("0", nil, nil)
-			} else {
-				tp.AddField(o.elapsed, nil, nil)
-			}
-			tp.AddField(o.link, nil, nil)
+			fmt.Fprintf(opts.IO.ErrOut, "failed to start pager: %v\n", err)
+		}
+	}
+
+	// Do not return err until we can StopAlternateScreenBuffer()
+	for {
+		if counts.Pending != 0 && opts.Watch {
+			opts.IO.RefreshScreen()
+			cs := opts.IO.ColorScheme()
+			fmt.Fprintln(opts.IO.Out, cs.Boldf("Refreshing checks status every %v seconds. Press Ctrl+C to quit.\n", opts.Interval.Seconds()))
 		}
 
-		tp.EndRow()
-	}
-
-	summary := ""
-	if failing+passing+pending > 0 {
-		if failing > 0 {
-			summary = "Some checks were not successful"
-		} else if pending > 0 {
-			summary = "Some checks are still pending"
-		} else {
-			summary = "All checks were successful"
+		printSummary(opts.IO, counts)
+		err = printTable(opts.IO, checks)
+		if err != nil {
+			break
 		}
 
-		tallies := fmt.Sprintf(
-			"%d failing, %d successful, and %d pending checks",
-			failing, passing, pending)
+		if counts.Pending == 0 || !opts.Watch {
+			break
+		}
 
-		summary = fmt.Sprintf("%s\n%s", utils.Bold(summary), tallies)
+		if opts.FailFast && counts.Failed > 0 {
+			break
+		}
+
+		time.Sleep(opts.Interval)
+
+		checks, counts, err = populateStatusChecks(client, repo, pr, opts.Required, includeEvent)
+		if err != nil {
+			break
+		}
 	}
 
-	if opts.IO.IsStdoutTTY() {
-		fmt.Fprintln(opts.IO.Out, summary)
-		fmt.Fprintln(opts.IO.Out)
-	}
-
-	err = tp.Render()
+	opts.IO.StopAlternateScreenBuffer()
 	if err != nil {
 		return err
 	}
 
-	if failing+pending > 0 {
+	if opts.Watch {
+		// Print final summary to original screen buffer
+		printSummary(opts.IO, counts)
+		err = printTable(opts.IO, checks)
+		if err != nil {
+			return err
+		}
+	}
+
+	if counts.Failed > 0 {
 		return cmdutil.SilentError
+	} else if counts.Pending > 0 {
+		return cmdutil.PendingError
 	}
 
 	return nil
+}
+
+func populateStatusChecks(client *http.Client, repo ghrepo.Interface, pr *api.PullRequest, requiredChecks bool, includeEvent bool) ([]check, checkCounts, error) {
+	apiClient := api.NewClientFromHTTP(client)
+
+	type response struct {
+		Node *api.PullRequest
+	}
+
+	query := fmt.Sprintf(`
+	query PullRequestStatusChecks($id: ID!, $endCursor: String) {
+		node(id: $id) {
+			...on PullRequest {
+				%s
+			}
+		}
+	}`, api.RequiredStatusCheckRollupGraphQL("$id", "$endCursor", includeEvent))
+
+	variables := map[string]interface{}{
+		"id": pr.ID,
+	}
+
+	statusCheckRollup := api.CheckContexts{}
+
+	for {
+		var resp response
+		err := apiClient.GraphQL(repo.RepoHost(), query, variables, &resp)
+		if err != nil {
+			return nil, checkCounts{}, err
+		}
+
+		if len(resp.Node.StatusCheckRollup.Nodes) == 0 {
+			return nil, checkCounts{}, errors.New("no commit found on the pull request")
+		}
+
+		result := resp.Node.StatusCheckRollup.Nodes[0].Commit.StatusCheckRollup.Contexts
+		statusCheckRollup.Nodes = append(
+			statusCheckRollup.Nodes,
+			result.Nodes...,
+		)
+
+		if !result.PageInfo.HasNextPage {
+			break
+		}
+		variables["endCursor"] = result.PageInfo.EndCursor
+	}
+
+	if len(statusCheckRollup.Nodes) == 0 {
+		return nil, checkCounts{}, fmt.Errorf("no checks reported on the '%s' branch", pr.HeadRefName)
+	}
+
+	checks, counts := aggregateChecks(statusCheckRollup.Nodes, requiredChecks)
+	if len(checks) == 0 && requiredChecks {
+		return checks, counts, fmt.Errorf("no required checks reported on the '%s' branch", pr.HeadRefName)
+	}
+	return checks, counts, nil
 }

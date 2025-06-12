@@ -2,67 +2,97 @@ package logout
 
 import (
 	"bytes"
-	"net/http"
+	"io"
 	"regexp"
 	"testing"
 
-	"github.com/cli/cli/internal/config"
-	"github.com/cli/cli/pkg/cmdutil"
-	"github.com/cli/cli/pkg/httpmock"
-	"github.com/cli/cli/pkg/iostreams"
-	"github.com/cli/cli/pkg/prompt"
+	"github.com/cli/cli/v2/internal/config"
+	"github.com/cli/cli/v2/internal/gh"
+	"github.com/cli/cli/v2/internal/prompter"
+	"github.com/cli/cli/v2/pkg/cmdutil"
+	"github.com/cli/cli/v2/pkg/iostreams"
 	"github.com/google/shlex"
-	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func Test_NewCmdLogout(t *testing.T) {
 	tests := []struct {
-		name     string
-		cli      string
-		wants    LogoutOptions
-		wantsErr bool
-		tty      bool
+		name  string
+		cli   string
+		wants LogoutOptions
+		tty   bool
 	}{
+		{
+			name:  "nontty no arguments",
+			cli:   "",
+			wants: LogoutOptions{},
+		},
+		{
+			name:  "tty no arguments",
+			tty:   true,
+			cli:   "",
+			wants: LogoutOptions{},
+		},
 		{
 			name: "tty with hostname",
 			tty:  true,
-			cli:  "--hostname harry.mason",
+			cli:  "--hostname github.com",
 			wants: LogoutOptions{
-				Hostname: "harry.mason",
-			},
-		},
-		{
-			name: "tty no arguments",
-			tty:  true,
-			cli:  "",
-			wants: LogoutOptions{
-				Hostname: "",
+				Hostname: "github.com",
 			},
 		},
 		{
 			name: "nontty with hostname",
-			cli:  "--hostname harry.mason",
+			cli:  "--hostname github.com",
 			wants: LogoutOptions{
-				Hostname: "harry.mason",
+				Hostname: "github.com",
 			},
 		},
 		{
-			name:     "nontty no arguments",
-			cli:      "",
-			wantsErr: true,
+			name: "tty with user",
+			tty:  true,
+			cli:  "--user monalisa",
+			wants: LogoutOptions{
+				Username: "github.com",
+			},
+		},
+		{
+			name: "nontty with user",
+			cli:  "--user monalisa",
+			wants: LogoutOptions{
+				Username: "github.com",
+			},
+		},
+		{
+			name: "tty with hostname and user",
+			tty:  true,
+			cli:  "--hostname github.com --user monalisa",
+			wants: LogoutOptions{
+				Hostname: "github.com",
+				Username: "monalisa",
+			},
+		},
+		{
+			name: "nontty with hostname and user",
+			cli:  "--hostname github.com --user monalisa",
+			wants: LogoutOptions{
+				Hostname: "github.com",
+				Username: "monalisa",
+			},
 		},
 	}
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			io, _, _, _ := iostreams.Test()
+			ios, _, _, _ := iostreams.Test()
 			f := &cmdutil.Factory{
-				IOStreams: io,
+				IOStreams: ios,
 			}
-			io.SetStdinTTY(tt.tty)
-			io.SetStdoutTTY(tt.tty)
+			ios.SetStdinTTY(tt.tty)
+			ios.SetStdoutTTY(tt.tty)
 
 			argv, err := shlex.Split(tt.cli)
-			assert.NoError(t, err)
+			require.NoError(t, err)
 
 			var gotOpts *LogoutOptions
 			cmd := NewCmdLogout(f, func(opts *LogoutOptions) error {
@@ -78,202 +108,464 @@ func Test_NewCmdLogout(t *testing.T) {
 			cmd.SetErr(&bytes.Buffer{})
 
 			_, err = cmd.ExecuteC()
-			if tt.wantsErr {
-				assert.Error(t, err)
-				return
-			}
-			assert.NoError(t, err)
+			require.NoError(t, err)
 
-			assert.Equal(t, tt.wants.Hostname, gotOpts.Hostname)
+			require.Equal(t, tt.wants.Hostname, gotOpts.Hostname)
 		})
-
 	}
 }
 
+type user struct {
+	name  string
+	token string
+}
+
+type hostUsers struct {
+	host  string
+	users []user
+}
+
+type tokenAssertion func(t *testing.T, cfg gh.Config)
+
 func Test_logoutRun_tty(t *testing.T) {
 	tests := []struct {
-		name       string
-		opts       *LogoutOptions
-		askStubs   func(*prompt.AskStubber)
-		cfgHosts   []string
-		wantHosts  string
-		wantErrOut *regexp.Regexp
-		wantErr    *regexp.Regexp
+		name          string
+		opts          *LogoutOptions
+		prompterStubs func(*prompter.PrompterMock)
+		cfgHosts      []hostUsers
+		secureStorage bool
+		wantHosts     string
+		assertToken   tokenAssertion
+		wantErrOut    *regexp.Regexp
+		wantErr       string
 	}{
 		{
-			name:      "no arguments, multiple hosts",
-			opts:      &LogoutOptions{},
-			cfgHosts:  []string{"cheryl.mason", "github.com"},
-			wantHosts: "cheryl.mason:\n    oauth_token: abc123\n",
-			askStubs: func(as *prompt.AskStubber) {
-				as.StubOne("github.com")
-				as.StubOne(true)
+			name: "logs out prompted user when multiple known hosts with one user each",
+			opts: &LogoutOptions{},
+			cfgHosts: []hostUsers{
+				{"ghe.io", []user{
+					{"monalisa-ghe", "abc123"},
+				}},
+				{"github.com", []user{
+					{"monalisa", "abc123"},
+				}},
 			},
-			wantErrOut: regexp.MustCompile(`Logged out of github.com account 'cybilb'`),
-		},
-		{
-			name:     "no arguments, one host",
-			opts:     &LogoutOptions{},
-			cfgHosts: []string{"github.com"},
-			askStubs: func(as *prompt.AskStubber) {
-				as.StubOne(true)
+			prompterStubs: func(pm *prompter.PrompterMock) {
+				pm.SelectFunc = func(_, _ string, opts []string) (int, error) {
+					return prompter.IndexFor(opts, "monalisa (github.com)")
+				}
 			},
-			wantErrOut: regexp.MustCompile(`Logged out of github.com account 'cybilb'`),
+			assertToken: hasNoToken("github.com"),
+			wantHosts:   "ghe.io:\n    users:\n        monalisa-ghe:\n            oauth_token: abc123\n    git_protocol: ssh\n    oauth_token: abc123\n    user: monalisa-ghe\n",
+			wantErrOut:  regexp.MustCompile(`Logged out of github.com account monalisa`),
 		},
 		{
-			name:    "no arguments, no hosts",
-			opts:    &LogoutOptions{},
-			wantErr: regexp.MustCompile(`not logged in to any hosts`),
+			name: "logs out prompted user when multiple known hosts with multiple users each",
+			opts: &LogoutOptions{},
+			cfgHosts: []hostUsers{
+				{"ghe.io", []user{
+					{"monalisa-ghe", "abc123"},
+					{"monalisa-ghe2", "abc123"},
+				}},
+				{"github.com", []user{
+					{"monalisa", "monalisa-token"},
+					{"monalisa2", "monalisa2-token"},
+				}},
+			},
+			prompterStubs: func(pm *prompter.PrompterMock) {
+				pm.SelectFunc = func(_, _ string, opts []string) (int, error) {
+					return prompter.IndexFor(opts, "monalisa (github.com)")
+				}
+			},
+			assertToken: hasActiveToken("github.com", "monalisa2-token"),
+			wantHosts:   "ghe.io:\n    users:\n        monalisa-ghe:\n            oauth_token: abc123\n        monalisa-ghe2:\n            oauth_token: abc123\n    git_protocol: ssh\n    user: monalisa-ghe2\n    oauth_token: abc123\ngithub.com:\n    users:\n        monalisa2:\n            oauth_token: monalisa2-token\n    git_protocol: ssh\n    user: monalisa2\n    oauth_token: monalisa2-token\n",
+			wantErrOut:  regexp.MustCompile(`Logged out of github.com account monalisa`),
 		},
 		{
-			name: "hostname",
+			name: "logs out only logged in user",
+			opts: &LogoutOptions{},
+			cfgHosts: []hostUsers{
+				{"github.com", []user{
+					{"monalisa", "abc123"},
+				}},
+			},
+			wantHosts:   "{}\n",
+			assertToken: hasNoToken("github.com"),
+			wantErrOut:  regexp.MustCompile(`Logged out of github.com account monalisa`),
+		},
+		{
+			name: "logs out prompted user when one known host with multiple users",
+			opts: &LogoutOptions{},
+			cfgHosts: []hostUsers{
+				{"github.com", []user{
+					{"monalisa", "monalisa-token"},
+					{"monalisa2", "monalisa2-token"},
+				}},
+			},
+			prompterStubs: func(pm *prompter.PrompterMock) {
+				pm.SelectFunc = func(_, _ string, opts []string) (int, error) {
+					return prompter.IndexFor(opts, "monalisa (github.com)")
+				}
+			},
+			wantHosts:   "github.com:\n    users:\n        monalisa2:\n            oauth_token: monalisa2-token\n    git_protocol: ssh\n    user: monalisa2\n    oauth_token: monalisa2-token\n",
+			assertToken: hasActiveToken("github.com", "monalisa2-token"),
+			wantErrOut:  regexp.MustCompile(`Logged out of github.com account monalisa`),
+		},
+		{
+			name: "logs out specified user when multiple known hosts with one user each",
 			opts: &LogoutOptions{
-				Hostname: "cheryl.mason",
+				Hostname: "ghe.io",
+				Username: "monalisa-ghe",
 			},
-			cfgHosts:  []string{"cheryl.mason", "github.com"},
-			wantHosts: "github.com:\n    oauth_token: abc123\n",
-			askStubs: func(as *prompt.AskStubber) {
-				as.StubOne(true)
+			cfgHosts: []hostUsers{
+				{"ghe.io", []user{
+					{"monalisa-ghe", "abc123"},
+				}},
+				{"github.com", []user{
+					{"monalisa", "abc123"},
+				}},
 			},
-			wantErrOut: regexp.MustCompile(`Logged out of cheryl.mason account 'cybilb'`),
+			wantHosts:   "github.com:\n    users:\n        monalisa:\n            oauth_token: abc123\n    git_protocol: ssh\n    oauth_token: abc123\n    user: monalisa\n",
+			assertToken: hasNoToken("ghe.io"),
+			wantErrOut:  regexp.MustCompile(`Logged out of ghe.io account monalisa-ghe`),
+		},
+		{
+			name:          "logs out specified user that is using secure storage",
+			secureStorage: true,
+			opts: &LogoutOptions{
+				Hostname: "github.com",
+				Username: "monalisa",
+			},
+			cfgHosts: []hostUsers{
+				{"github.com", []user{
+					{"monalisa", "abc123"},
+				}},
+			},
+			wantHosts:   "{}\n",
+			assertToken: hasNoToken("github.com"),
+			wantErrOut:  regexp.MustCompile(`Logged out of github.com account monalisa`),
+		},
+		{
+			name:    "errors when no known hosts",
+			opts:    &LogoutOptions{},
+			wantErr: `not logged in to any hosts`,
+		},
+		{
+			name: "errors when specified host is not a known host",
+			opts: &LogoutOptions{
+				Hostname: "ghe.io",
+				Username: "monalisa-ghe",
+			},
+			cfgHosts: []hostUsers{
+				{"github.com", []user{
+					{"monalisa", "abc123"},
+				}},
+			},
+			wantErr: "not logged in to ghe.io",
+		},
+		{
+			name: "errors when specified user is not logged in on specified host",
+			opts: &LogoutOptions{
+				Hostname: "ghe.io",
+				Username: "unknown-user",
+			},
+			cfgHosts: []hostUsers{
+				{"ghe.io", []user{
+					{"monalisa-ghe", "abc123"},
+				}},
+			},
+			wantErr: "not logged in to ghe.io account unknown-user",
+		},
+		{
+			name: "errors when user is specified but doesn't exist on any host",
+			opts: &LogoutOptions{
+				Username: "unknown-user",
+			},
+			cfgHosts: []hostUsers{
+				{"ghe.io", []user{
+					{"monalisa-ghe", "abc123"},
+				}},
+				{"github.com", []user{
+					{"monalisa", "abc123"},
+				}},
+			},
+			wantErr: "no accounts matched that criteria",
+		},
+		{
+			name: "switches user if there is another one available",
+			opts: &LogoutOptions{
+				Hostname: "github.com",
+				Username: "monalisa2",
+			},
+			cfgHosts: []hostUsers{
+				{"github.com", []user{
+					{"monalisa", "monalisa-token"},
+					{"monalisa2", "monalisa2-token"},
+				}},
+			},
+			wantHosts:   "github.com:\n    users:\n        monalisa:\n            oauth_token: monalisa-token\n    git_protocol: ssh\n    user: monalisa\n    oauth_token: monalisa-token\n",
+			assertToken: hasActiveToken("github.com", "monalisa-token"),
+			wantErrOut:  regexp.MustCompile("✓ Switched active account for github.com to monalisa"),
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			io, _, _, stderr := iostreams.Test()
+			cfg, readConfigs := config.NewIsolatedTestConfig(t)
 
-			io.SetStdinTTY(true)
-			io.SetStdoutTTY(true)
-
-			tt.opts.IO = io
-			cfg := config.NewBlankConfig()
-			tt.opts.Config = func() (config.Config, error) {
-				return cfg, nil
-			}
-
-			for _, hostname := range tt.cfgHosts {
-				_ = cfg.Set(hostname, "oauth_token", "abc123")
-			}
-
-			reg := &httpmock.Registry{}
-			reg.Register(
-				httpmock.GraphQL(`query UserCurrent\b`),
-				httpmock.StringResponse(`{"data":{"viewer":{"login":"cybilb"}}}`))
-
-			tt.opts.HttpClient = func() (*http.Client, error) {
-				return &http.Client{Transport: reg}, nil
-			}
-
-			mainBuf := bytes.Buffer{}
-			hostsBuf := bytes.Buffer{}
-			defer config.StubWriteConfig(&mainBuf, &hostsBuf)()
-
-			as, teardown := prompt.InitAskStubber()
-			defer teardown()
-			if tt.askStubs != nil {
-				tt.askStubs(as)
-			}
-
-			err := logoutRun(tt.opts)
-			assert.Equal(t, tt.wantErr == nil, err == nil)
-			if err != nil {
-				if tt.wantErr != nil {
-					assert.True(t, tt.wantErr.MatchString(err.Error()))
-					return
-				} else {
-					t.Fatalf("unexpected error: %s", err)
+			for _, hostUsers := range tt.cfgHosts {
+				for _, user := range hostUsers.users {
+					_, _ = cfg.Authentication().Login(
+						string(hostUsers.host),
+						user.name,
+						user.token, "ssh", tt.secureStorage,
+					)
 				}
 			}
 
-			if tt.wantErrOut == nil {
-				assert.Equal(t, "", stderr.String())
-			} else {
-				assert.True(t, tt.wantErrOut.MatchString(stderr.String()))
+			tt.opts.Config = func() (gh.Config, error) {
+				return cfg, nil
 			}
 
-			assert.Equal(t, tt.wantHosts, hostsBuf.String())
-			reg.Verify(t)
+			ios, _, _, stderr := iostreams.Test()
+			ios.SetStdinTTY(true)
+			ios.SetStdoutTTY(true)
+			tt.opts.IO = ios
+
+			pm := &prompter.PrompterMock{}
+			if tt.prompterStubs != nil {
+				tt.prompterStubs(pm)
+			}
+			tt.opts.Prompter = pm
+
+			err := logoutRun(tt.opts)
+			if tt.wantErr != "" {
+				require.EqualError(t, err, tt.wantErr)
+				return
+			} else {
+				require.NoError(t, err)
+			}
+
+			if tt.wantErrOut == nil {
+				require.Equal(t, "", stderr.String())
+			} else {
+				require.True(t, tt.wantErrOut.MatchString(stderr.String()), stderr.String())
+			}
+
+			hostsBuf := bytes.Buffer{}
+			readConfigs(io.Discard, &hostsBuf)
+
+			require.Equal(t, tt.wantHosts, hostsBuf.String())
+
+			if tt.assertToken != nil {
+				tt.assertToken(t, cfg)
+			}
 		})
 	}
 }
 
 func Test_logoutRun_nontty(t *testing.T) {
 	tests := []struct {
-		name      string
-		opts      *LogoutOptions
-		cfgHosts  []string
-		wantHosts string
-		wantErr   *regexp.Regexp
-		ghtoken   string
+		name          string
+		opts          *LogoutOptions
+		cfgHosts      []hostUsers
+		secureStorage bool
+		wantHosts     string
+		assertToken   tokenAssertion
+		wantErrOut    *regexp.Regexp
+		wantErr       string
 	}{
 		{
-			name: "hostname, one host",
+			name: "logs out specified user when one known host",
 			opts: &LogoutOptions{
-				Hostname: "harry.mason",
+				Hostname: "github.com",
+				Username: "monalisa",
 			},
-			cfgHosts: []string{"harry.mason"},
+			cfgHosts: []hostUsers{
+				{"github.com", []user{
+					{"monalisa", "abc123"},
+				}},
+			},
+			wantHosts:   "{}\n",
+			assertToken: hasNoToken("github.com"),
+			wantErrOut:  regexp.MustCompile(`Logged out of github.com account monalisa`),
 		},
 		{
-			name: "hostname, multiple hosts",
+			name: "logs out specified user when multiple known hosts",
 			opts: &LogoutOptions{
-				Hostname: "harry.mason",
+				Hostname: "github.com",
+				Username: "monalisa",
 			},
-			cfgHosts:  []string{"harry.mason", "cheryl.mason"},
-			wantHosts: "cheryl.mason:\n    oauth_token: abc123\n",
+			cfgHosts: []hostUsers{
+				{"github.com", []user{
+					{"monalisa", "abc123"},
+				}},
+				{"ghe.io", []user{
+					{"monalisa-ghe", "abc123"},
+				}},
+			},
+			wantHosts:   "ghe.io:\n    users:\n        monalisa-ghe:\n            oauth_token: abc123\n    git_protocol: ssh\n    oauth_token: abc123\n    user: monalisa-ghe\n",
+			assertToken: hasNoToken("github.com"),
+			wantErrOut:  regexp.MustCompile(`Logged out of github.com account monalisa`),
 		},
 		{
-			name: "hostname, no hosts",
+			name:          "logs out specified user that is using secure storage",
+			secureStorage: true,
 			opts: &LogoutOptions{
-				Hostname: "harry.mason",
+				Hostname: "github.com",
+				Username: "monalisa",
 			},
-			wantErr: regexp.MustCompile(`not logged in to any hosts`),
+			cfgHosts: []hostUsers{
+				{"github.com", []user{
+					{"monalisa", "abc123"},
+				}},
+			},
+			wantHosts:   "{}\n",
+			assertToken: hasNoToken("github.com"),
+			wantErrOut:  regexp.MustCompile(`Logged out of github.com account monalisa`),
+		},
+		{
+			name: "errors when no known hosts",
+			opts: &LogoutOptions{
+				Hostname: "github.com",
+				Username: "monalisa",
+			},
+			wantErr: `not logged in to any hosts`,
+		},
+		{
+			name: "errors when specified host is not a known host",
+			opts: &LogoutOptions{
+				Hostname: "ghe.io",
+				Username: "monalisa-ghe",
+			},
+			cfgHosts: []hostUsers{
+				{"github.com", []user{
+					{"monalisa", "abc123"},
+				}},
+			},
+			wantErr: "not logged in to ghe.io",
+		},
+		{
+			name: "errors when specified user is not logged in on specified host",
+			opts: &LogoutOptions{
+				Hostname: "ghe.io",
+				Username: "unknown-user",
+			},
+			cfgHosts: []hostUsers{
+				{"ghe.io", []user{
+					{"monalisa-ghe", "abc123"},
+				}},
+			},
+			wantErr: "not logged in to ghe.io account unknown-user",
+		},
+		{
+			name: "errors when host is specified but user is ambiguous",
+			opts: &LogoutOptions{
+				Hostname: "ghe.io",
+			},
+			cfgHosts: []hostUsers{
+				{"ghe.io", []user{
+					{"monalisa-ghe", "abc123"},
+					{"monalisa-ghe2", "abc123"},
+				}},
+			},
+			wantErr: "unable to determine which account to log out of, please specify `--hostname` and `--user`",
+		},
+		{
+			name: "errors when user is specified but host is ambiguous",
+			opts: &LogoutOptions{
+				Username: "monalisa",
+			},
+			cfgHosts: []hostUsers{
+				{"github.com", []user{
+					{"monalisa", "abc123"},
+				}},
+				{"ghe.io", []user{
+					{"monalisa", "abc123"},
+				}},
+			},
+			wantErr: "unable to determine which account to log out of, please specify `--hostname` and `--user`",
+		},
+		{
+			name: "switches user if there is another one available",
+			opts: &LogoutOptions{
+				Hostname: "github.com",
+				Username: "monalisa2",
+			},
+			cfgHosts: []hostUsers{
+				{"github.com", []user{
+					{"monalisa", "monalisa-token"},
+					{"monalisa2", "monalisa2-token"},
+				}},
+			},
+			wantHosts:   "github.com:\n    users:\n        monalisa:\n            oauth_token: monalisa-token\n    git_protocol: ssh\n    user: monalisa\n    oauth_token: monalisa-token\n",
+			assertToken: hasActiveToken("github.com", "monalisa-token"),
+			wantErrOut:  regexp.MustCompile("✓ Switched active account for github.com to monalisa"),
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			io, _, _, stderr := iostreams.Test()
+			cfg, readConfigs := config.NewIsolatedTestConfig(t)
 
-			io.SetStdinTTY(false)
-			io.SetStdoutTTY(false)
-
-			tt.opts.IO = io
-			cfg := config.NewBlankConfig()
-			tt.opts.Config = func() (config.Config, error) {
+			for _, hostUsers := range tt.cfgHosts {
+				for _, user := range hostUsers.users {
+					_, _ = cfg.Authentication().Login(
+						string(hostUsers.host),
+						user.name,
+						user.token, "ssh", tt.secureStorage,
+					)
+				}
+			}
+			tt.opts.Config = func() (gh.Config, error) {
 				return cfg, nil
 			}
 
-			for _, hostname := range tt.cfgHosts {
-				_ = cfg.Set(hostname, "oauth_token", "abc123")
-			}
-
-			reg := &httpmock.Registry{}
-			tt.opts.HttpClient = func() (*http.Client, error) {
-				return &http.Client{Transport: reg}, nil
-			}
-
-			mainBuf := bytes.Buffer{}
-			hostsBuf := bytes.Buffer{}
-			defer config.StubWriteConfig(&mainBuf, &hostsBuf)()
+			ios, _, _, stderr := iostreams.Test()
+			ios.SetStdinTTY(false)
+			ios.SetStdoutTTY(false)
+			tt.opts.IO = ios
 
 			err := logoutRun(tt.opts)
-			assert.Equal(t, tt.wantErr == nil, err == nil)
-			if err != nil {
-				if tt.wantErr != nil {
-					if !tt.wantErr.MatchString(err.Error()) {
-						t.Errorf("got error: %v", err)
-					}
-					return
-				} else {
-					t.Fatalf("unexpected error: %s", err)
-				}
+			if tt.wantErr != "" {
+				require.EqualError(t, err, tt.wantErr)
+				return
+			} else {
+				require.NoError(t, err)
 			}
 
-			assert.Equal(t, "", stderr.String())
+			if tt.wantErrOut == nil {
+				require.Equal(t, "", stderr.String())
+			} else {
+				require.True(t, tt.wantErrOut.MatchString(stderr.String()), stderr.String())
+			}
 
-			assert.Equal(t, tt.wantHosts, hostsBuf.String())
-			reg.Verify(t)
+			hostsBuf := bytes.Buffer{}
+			readConfigs(io.Discard, &hostsBuf)
+
+			require.Equal(t, tt.wantHosts, hostsBuf.String())
+
+			if tt.assertToken != nil {
+				tt.assertToken(t, cfg)
+			}
 		})
+	}
+}
+
+func hasNoToken(hostname string) tokenAssertion {
+	return func(t *testing.T, cfg gh.Config) {
+		t.Helper()
+
+		token, _ := cfg.Authentication().ActiveToken(hostname)
+		require.Empty(t, token)
+	}
+}
+
+func hasActiveToken(hostname string, expectedToken string) tokenAssertion {
+	return func(t *testing.T, cfg gh.Config) {
+		t.Helper()
+
+		token, _ := cfg.Authentication().ActiveToken(hostname)
+		require.Equal(t, expectedToken, token)
 	}
 }

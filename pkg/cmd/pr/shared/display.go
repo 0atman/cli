@@ -2,65 +2,100 @@ package shared
 
 import (
 	"fmt"
-	"io"
-	"strings"
 
-	"github.com/cli/cli/api"
-	"github.com/cli/cli/utils"
+	"github.com/cli/cli/v2/api"
+	"github.com/cli/cli/v2/internal/text"
+	"github.com/cli/cli/v2/pkg/cmdutil"
+	"github.com/cli/cli/v2/pkg/iostreams"
 )
 
-func StateTitleWithColor(pr api.PullRequest) string {
-	prStateColorFunc := ColorFuncForPR(pr)
+func StateTitleWithColor(cs *iostreams.ColorScheme, pr api.PullRequest) string {
+	prStateColorFunc := cs.ColorFromString(ColorForPRState(pr))
 	if pr.State == "OPEN" && pr.IsDraft {
-		return prStateColorFunc(strings.Title(strings.ToLower("Draft")))
+		return prStateColorFunc("Draft")
 	}
-	return prStateColorFunc(strings.Title(strings.ToLower(pr.State)))
+	return prStateColorFunc(text.Title(pr.State))
 }
 
-func ColorFuncForPR(pr api.PullRequest) func(string) string {
-	if pr.State == "OPEN" && pr.IsDraft {
-		return utils.Gray
+func PrStateWithDraft(pr *api.PullRequest) string {
+	if pr.IsDraft && pr.State == "OPEN" {
+		return "DRAFT"
 	}
-	return ColorFuncForState(pr.State)
+
+	return pr.State
 }
 
-// ColorFuncForState returns a color function for a PR/Issue state
-func ColorFuncForState(state string) func(string) string {
-	switch state {
+func ColorForPRState(pr api.PullRequest) string {
+	switch pr.State {
 	case "OPEN":
-		return utils.Green
+		if pr.IsDraft {
+			return "gray"
+		}
+		return "green"
 	case "CLOSED":
-		return utils.Red
+		return "red"
 	case "MERGED":
-		return utils.Magenta
+		return "magenta"
 	default:
-		return nil
+		return ""
 	}
 }
 
-func PrintHeader(w io.Writer, s string) {
-	fmt.Fprintln(w, utils.Bold(s))
+func ColorForIssueState(issue api.Issue) string {
+	switch issue.State {
+	case "OPEN":
+		return "green"
+	case "CLOSED":
+		if issue.StateReason == "NOT_PLANNED" {
+			return "gray"
+		}
+		return "magenta"
+	default:
+		return ""
+	}
 }
 
-func PrintMessage(w io.Writer, s string) {
-	fmt.Fprintln(w, utils.Gray(s))
+func PrintHeader(io *iostreams.IOStreams, s string) {
+	fmt.Fprintln(io.Out, io.ColorScheme().Bold(s))
+}
+
+func PrintMessage(io *iostreams.IOStreams, s string) {
+	fmt.Fprintln(io.Out, io.ColorScheme().Muted(s))
+}
+
+func ListNoResults(repoName string, itemName string, hasFilters bool) error {
+	if hasFilters {
+		return cmdutil.NewNoResultsError(fmt.Sprintf("no %ss match your search in %s", itemName, repoName))
+	}
+	return cmdutil.NewNoResultsError(fmt.Sprintf("no open %ss in %s", itemName, repoName))
 }
 
 func ListHeader(repoName string, itemName string, matchCount int, totalMatchCount int, hasFilters bool) string {
-	if totalMatchCount == 0 {
-		if hasFilters {
-			return fmt.Sprintf("No %ss match your search in %s", itemName, repoName)
-		}
-		return fmt.Sprintf("There are no open %ss in %s", itemName, repoName)
-	}
-
 	if hasFilters {
 		matchVerb := "match"
 		if totalMatchCount == 1 {
 			matchVerb = "matches"
 		}
-		return fmt.Sprintf("Showing %d of %s in %s that %s your search", matchCount, utils.Pluralize(totalMatchCount, itemName), repoName, matchVerb)
+		return fmt.Sprintf("Showing %d of %s in %s that %s your search", matchCount, text.Pluralize(totalMatchCount, itemName), repoName, matchVerb)
 	}
 
-	return fmt.Sprintf("Showing %d of %s in %s", matchCount, utils.Pluralize(totalMatchCount, fmt.Sprintf("open %s", itemName)), repoName)
+	return fmt.Sprintf("Showing %d of %s in %s", matchCount, text.Pluralize(totalMatchCount, fmt.Sprintf("open %s", itemName)), repoName)
+}
+
+func PrCheckStatusSummaryWithColor(cs *iostreams.ColorScheme, checks api.PullRequestChecksStatus) string {
+	var summary = cs.Muted("No checks")
+	if checks.Total > 0 {
+		if checks.Failing > 0 {
+			if checks.Failing == checks.Total {
+				summary = cs.Red("× All checks failing")
+			} else {
+				summary = cs.Redf("× %d/%d checks failing", checks.Failing, checks.Total)
+			}
+		} else if checks.Pending > 0 {
+			summary = cs.Yellow("- Checks pending")
+		} else if checks.Passing == checks.Total {
+			summary = cs.Green("✓ Checks passing")
+		}
+	}
+	return summary
 }

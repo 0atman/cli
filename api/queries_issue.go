@@ -1,15 +1,11 @@
 package api
 
 import (
-	"context"
-	"encoding/base64"
+	"encoding/json"
 	"fmt"
-	"strconv"
-	"strings"
 	"time"
 
-	"github.com/cli/cli/internal/ghrepo"
-	"github.com/shurcooL/githubv4"
+	"github.com/cli/cli/v2/internal/ghrepo"
 )
 
 type IssuesPayload struct {
@@ -19,74 +15,249 @@ type IssuesPayload struct {
 }
 
 type IssuesAndTotalCount struct {
-	Issues     []Issue
+	Issues       []Issue
+	TotalCount   int
+	SearchCapped bool
+}
+
+type Issue struct {
+	Typename         string `json:"__typename"`
+	ID               string
+	Number           int
+	Title            string
+	URL              string
+	State            string
+	StateReason      string
+	Closed           bool
+	Body             string
+	ActiveLockReason string
+	Locked           bool
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
+	ClosedAt         *time.Time
+	Comments         Comments
+	Author           Author
+	Assignees        Assignees
+	AssignedActors   AssignedActors
+	Labels           Labels
+	ProjectCards     ProjectCards
+	ProjectItems     ProjectItems
+	Milestone        *Milestone
+	ReactionGroups   ReactionGroups
+	IsPinned         bool
+
+	ClosedByPullRequestsReferences ClosedByPullRequestsReferences
+}
+
+type ClosedByPullRequestsReferences struct {
+	Nodes []struct {
+		ID         string
+		Number     int
+		URL        string
+		Repository struct {
+			ID    string
+			Name  string
+			Owner struct {
+				ID    string
+				Login string
+			}
+		}
+	}
+	PageInfo struct {
+		HasNextPage bool
+		EndCursor   string
+	}
+}
+
+// return values for Issue.Typename
+const (
+	TypeIssue       string = "Issue"
+	TypePullRequest string = "PullRequest"
+)
+
+func (i Issue) IsPullRequest() bool {
+	return i.Typename == TypePullRequest
+}
+
+type Assignees struct {
+	Nodes      []GitHubUser
 	TotalCount int
 }
 
-// Ref. https://developer.github.com/v4/object/issue/
-type Issue struct {
-	ID        string
-	Number    int
-	Title     string
-	URL       string
-	State     string
-	Closed    bool
-	Body      string
-	CreatedAt time.Time
-	UpdatedAt time.Time
-	Comments  struct {
-		TotalCount int
+func (a Assignees) Logins() []string {
+	logins := make([]string, len(a.Nodes))
+	for i, a := range a.Nodes {
+		logins[i] = a.Login
 	}
-	Author struct {
-		Login string
+	return logins
+}
+
+type AssignedActors struct {
+	Nodes      []Actor
+	TotalCount int
+}
+
+func (a AssignedActors) Logins() []string {
+	logins := make([]string, len(a.Nodes))
+	for i, a := range a.Nodes {
+		logins[i] = a.Login
 	}
-	Assignees struct {
-		Nodes []struct {
-			Login string
+	return logins
+}
+
+// DisplayNames returns a list of display names for the assigned actors.
+func (a AssignedActors) DisplayNames() []string {
+	// These display names are used for populating the "default" assigned actors
+	// from the AssignedActors type. But, this is only one piece of the puzzle
+	// as later, other queries will fetch the full list of possible assignable
+	// actors from the repository, and the two lists will be reconciled.
+	//
+	// It's important that the display names are the same between the defaults
+	// (the values returned here) and the full list (the values returned by
+	// other repository queries). Any discrepancy would result in an
+	// "invalid default", which means an assigned actor will not be matched
+	// to an assignable actor and not presented as a "default" selection.
+	// Not being presented as a default would cause the actor to be potentially
+	// unassigned if the edits were submitted.
+	//
+	// To prevent this, we need shared logic to look up an actor's display name.
+	// However, our API types between assignedActors and the full list of
+	// assignableActors are different. So, as an attempt to maintain
+	// consistency we convert the assignedActors to the same types as the
+	// repository's assignableActors, treating the assignableActors DisplayName
+	// methods as the sources of truth.
+	// TODO KW: make this comment less of a wall of text if needed.
+	var displayNames []string
+	for _, a := range a.Nodes {
+		if a.TypeName == "User" {
+			u := NewAssignableUser(
+				a.ID,
+				a.Login,
+				a.Name,
+			)
+			displayNames = append(displayNames, u.DisplayName())
+		} else if a.TypeName == "Bot" {
+			b := NewAssignableBot(
+				a.ID,
+				a.Login,
+			)
+			displayNames = append(displayNames, b.DisplayName())
 		}
-		TotalCount int
 	}
-	Labels struct {
-		Nodes []struct {
-			Name string
-		}
-		TotalCount int
+	return displayNames
+}
+
+type Labels struct {
+	Nodes      []IssueLabel
+	TotalCount int
+}
+
+func (l Labels) Names() []string {
+	names := make([]string, len(l.Nodes))
+	for i, l := range l.Nodes {
+		names[i] = l.Name
 	}
-	ProjectCards struct {
-		Nodes []struct {
-			Project struct {
-				Name string
-			}
-			Column struct {
-				Name string
-			}
-		}
-		TotalCount int
+	return names
+}
+
+type ProjectCards struct {
+	Nodes      []*ProjectInfo
+	TotalCount int
+}
+
+type ProjectItems struct {
+	Nodes []*ProjectV2Item
+}
+
+type ProjectInfo struct {
+	Project struct {
+		Name string `json:"name"`
+	} `json:"project"`
+	Column struct {
+		Name string `json:"name"`
+	} `json:"column"`
+}
+
+type ProjectV2Item struct {
+	ID      string `json:"id"`
+	Project ProjectV2ItemProject
+	Status  ProjectV2ItemStatus
+}
+
+type ProjectV2ItemProject struct {
+	ID    string `json:"id"`
+	Title string `json:"title"`
+}
+
+type ProjectV2ItemStatus struct {
+	OptionID string `json:"optionId"`
+	Name     string `json:"name"`
+}
+
+func (p ProjectCards) ProjectNames() []string {
+	names := make([]string, len(p.Nodes))
+	for i, c := range p.Nodes {
+		names[i] = c.Project.Name
 	}
-	Milestone struct {
-		Title string
+	return names
+}
+
+func (p ProjectItems) ProjectTitles() []string {
+	titles := make([]string, len(p.Nodes))
+	for i, c := range p.Nodes {
+		titles[i] = c.Project.Title
 	}
+	return titles
+}
+
+type Milestone struct {
+	Number      int        `json:"number"`
+	Title       string     `json:"title"`
+	Description string     `json:"description"`
+	DueOn       *time.Time `json:"dueOn"`
 }
 
 type IssuesDisabledError struct {
 	error
 }
 
-const fragments = `
-	fragment issue on Issue {
-		number
-		title
-		url
-		state
-		updatedAt
-		labels(first: 3) {
-			nodes {
-				name
-			}
-			totalCount
-		}
+type Owner struct {
+	ID    string `json:"id,omitempty"`
+	Name  string `json:"name,omitempty"`
+	Login string `json:"login"`
+}
+
+type Author struct {
+	ID    string
+	Name  string
+	Login string
+}
+
+func (author Author) MarshalJSON() ([]byte, error) {
+	if author.ID == "" {
+		return json.Marshal(map[string]interface{}{
+			"is_bot": true,
+			"login":  "app/" + author.Login,
+		})
 	}
-`
+	return json.Marshal(map[string]interface{}{
+		"is_bot": false,
+		"login":  author.Login,
+		"id":     author.ID,
+		"name":   author.Name,
+	})
+}
+
+type CommentAuthor struct {
+	Login string `json:"login"`
+	// Unfortunately, there is no easy way to add "id" and "name" fields to this struct because it's being
+	// used in both shurcool-graphql type queries and string-based queries where the response gets parsed
+	// by an ordinary JSON decoder that doesn't understand "graphql" directives via struct tags.
+	//	User  *struct {
+	//		ID   string
+	//		Name string
+	//	} `graphql:"... on User"`
+}
 
 // IssueCreate creates an issue in a GitHub repository
 func IssueCreate(client *Client, repo *Repository, params map[string]interface{}) (*Issue, error) {
@@ -94,6 +265,7 @@ func IssueCreate(client *Client, repo *Repository, params map[string]interface{}
 	mutation IssueCreate($input: CreateIssueInput!) {
 		createIssue(input: $input) {
 			issue {
+				id
 				url
 			}
 		}
@@ -103,7 +275,13 @@ func IssueCreate(client *Client, repo *Repository, params map[string]interface{}
 		"repositoryId": repo.ID,
 	}
 	for key, val := range params {
-		inputParams[key] = val
+		switch key {
+		case "assigneeIds", "body", "issueTemplate", "labelIds", "milestoneId", "projectIds", "repositoryId", "title":
+			inputParams[key] = val
+		case "projectV2Ids":
+		default:
+			return nil, fmt.Errorf("invalid IssueCreate mutation parameter %s", key)
+		}
 	}
 	variables := map[string]interface{}{
 		"input": inputParams,
@@ -119,11 +297,31 @@ func IssueCreate(client *Client, repo *Repository, params map[string]interface{}
 	if err != nil {
 		return nil, err
 	}
+	issue := &result.CreateIssue.Issue
 
-	return &result.CreateIssue.Issue, nil
+	// projectV2 parameters aren't supported in the `createIssue` mutation,
+	// so add them after the issue has been created.
+	projectV2Ids, ok := params["projectV2Ids"].([]string)
+	if ok {
+		projectItems := make(map[string]string, len(projectV2Ids))
+		for _, p := range projectV2Ids {
+			projectItems[p] = issue.ID
+		}
+		err = UpdateProjectV2Items(client, repo, projectItems, nil)
+		if err != nil {
+			return issue, err
+		}
+	}
+
+	return issue, nil
 }
 
-func IssueStatus(client *Client, repo ghrepo.Interface, currentUsername string) (*IssuesPayload, error) {
+type IssueStatusOptions struct {
+	Username string
+	Fields   []string
+}
+
+func IssueStatus(client *Client, repo ghrepo.Interface, options IssueStatusOptions) (*IssuesPayload, error) {
 	type response struct {
 		Repository struct {
 			Assigned struct {
@@ -142,6 +340,7 @@ func IssueStatus(client *Client, repo ghrepo.Interface, currentUsername string) 
 		}
 	}
 
+	fragments := fmt.Sprintf("fragment issue on Issue{%s}", IssueGraphQL(options.Fields))
 	query := fragments + `
 	query IssueStatus($owner: String!, $repo: String!, $viewer: String!, $per_page: Int = 10) {
 		repository(owner: $owner, name: $repo) {
@@ -165,12 +364,12 @@ func IssueStatus(client *Client, repo ghrepo.Interface, currentUsername string) 
 				}
 			}
 		}
-    }`
+	}`
 
 	variables := map[string]interface{}{
 		"owner":  repo.RepoOwner(),
 		"repo":   repo.RepoName(),
-		"viewer": currentUsername,
+		"viewer": options.Username,
 	}
 
 	var resp response
@@ -201,259 +400,14 @@ func IssueStatus(client *Client, repo ghrepo.Interface, currentUsername string) 
 	return &payload, nil
 }
 
-func IssueList(client *Client, repo ghrepo.Interface, state string, labels []string, assigneeString string, limit int, authorString string, mentionString string, milestoneString string) (*IssuesAndTotalCount, error) {
-	var states []string
-	switch state {
-	case "open", "":
-		states = []string{"OPEN"}
-	case "closed":
-		states = []string{"CLOSED"}
-	case "all":
-		states = []string{"OPEN", "CLOSED"}
-	default:
-		return nil, fmt.Errorf("invalid state: %s", state)
-	}
-
-	query := fragments + `
-	query IssueList($owner: String!, $repo: String!, $limit: Int, $endCursor: String, $states: [IssueState!] = OPEN, $labels: [String!], $assignee: String, $author: String, $mention: String, $milestone: String) {
-		repository(owner: $owner, name: $repo) {
-			hasIssuesEnabled
-			issues(first: $limit, after: $endCursor, orderBy: {field: CREATED_AT, direction: DESC}, states: $states, labels: $labels, filterBy: {assignee: $assignee, createdBy: $author, mentioned: $mention, milestone: $milestone}) {
-				totalCount
-				nodes {
-					...issue
-				}
-				pageInfo {
-					hasNextPage
-					endCursor
-				}
-			}
-		}
-	}
-	`
-
-	variables := map[string]interface{}{
-		"owner":  repo.RepoOwner(),
-		"repo":   repo.RepoName(),
-		"states": states,
-	}
-	if len(labels) > 0 {
-		variables["labels"] = labels
-	}
-	if assigneeString != "" {
-		variables["assignee"] = assigneeString
-	}
-	if authorString != "" {
-		variables["author"] = authorString
-	}
-	if mentionString != "" {
-		variables["mention"] = mentionString
-	}
-
-	if milestoneString != "" {
-		var milestone *RepoMilestone
-		if milestoneNumber, err := strconv.Atoi(milestoneString); err == nil {
-			milestone, err = MilestoneByNumber(client, repo, milestoneNumber)
-			if err != nil {
-				return nil, err
-			}
-		} else {
-			milestone, err = MilestoneByTitle(client, repo, milestoneString)
-			if err != nil {
-				return nil, err
-			}
-		}
-
-		milestoneRESTID, err := milestoneNodeIdToDatabaseId(milestone.ID)
-		if err != nil {
-			return nil, err
-		}
-		variables["milestone"] = milestoneRESTID
-	}
-
-	var response struct {
-		Repository struct {
-			Issues struct {
-				TotalCount int
-				Nodes      []Issue
-				PageInfo   struct {
-					HasNextPage bool
-					EndCursor   string
-				}
-			}
-			HasIssuesEnabled bool
-		}
-	}
-
-	var issues []Issue
-	pageLimit := min(limit, 100)
-
-loop:
-	for {
-		variables["limit"] = pageLimit
-		err := client.GraphQL(repo.RepoHost(), query, variables, &response)
-		if err != nil {
-			return nil, err
-		}
-		if !response.Repository.HasIssuesEnabled {
-			return nil, fmt.Errorf("the '%s' repository has disabled issues", ghrepo.FullName(repo))
-		}
-
-		for _, issue := range response.Repository.Issues.Nodes {
-			issues = append(issues, issue)
-			if len(issues) == limit {
-				break loop
-			}
-		}
-
-		if response.Repository.Issues.PageInfo.HasNextPage {
-			variables["endCursor"] = response.Repository.Issues.PageInfo.EndCursor
-			pageLimit = min(pageLimit, limit-len(issues))
-		} else {
-			break
-		}
-	}
-
-	res := IssuesAndTotalCount{Issues: issues, TotalCount: response.Repository.Issues.TotalCount}
-	return &res, nil
+func (i Issue) Link() string {
+	return i.URL
 }
 
-func IssueByNumber(client *Client, repo ghrepo.Interface, number int) (*Issue, error) {
-	type response struct {
-		Repository struct {
-			Issue            Issue
-			HasIssuesEnabled bool
-		}
-	}
-
-	query := `
-	query IssueByNumber($owner: String!, $repo: String!, $issue_number: Int!) {
-		repository(owner: $owner, name: $repo) {
-			hasIssuesEnabled
-			issue(number: $issue_number) {
-				id
-				title
-				state
-				closed
-				body
-				author {
-					login
-				}
-				comments {
-					totalCount
-				}
-				number
-				url
-				createdAt
-				assignees(first: 100) {
-					nodes {
-						login
-					}
-					totalCount
-				}
-				labels(first: 100) {
-					nodes {
-						name
-					}
-					totalCount
-				}
-				projectCards(first: 100) {
-					nodes {
-						project {
-							name
-						}
-						column {
-							name
-						}
-					}
-					totalCount
-				}
-				milestone{
-					title
-				}
-			}
-		}
-	}`
-
-	variables := map[string]interface{}{
-		"owner":        repo.RepoOwner(),
-		"repo":         repo.RepoName(),
-		"issue_number": number,
-	}
-
-	var resp response
-	err := client.GraphQL(repo.RepoHost(), query, variables, &resp)
-	if err != nil {
-		return nil, err
-	}
-
-	if !resp.Repository.HasIssuesEnabled {
-
-		return nil, &IssuesDisabledError{fmt.Errorf("the '%s' repository has disabled issues", ghrepo.FullName(repo))}
-	}
-
-	return &resp.Repository.Issue, nil
+func (i Issue) Identifier() string {
+	return i.ID
 }
 
-func IssueClose(client *Client, repo ghrepo.Interface, issue Issue) error {
-	var mutation struct {
-		CloseIssue struct {
-			Issue struct {
-				ID githubv4.ID
-			}
-		} `graphql:"closeIssue(input: $input)"`
-	}
-
-	variables := map[string]interface{}{
-		"input": githubv4.CloseIssueInput{
-			IssueID: issue.ID,
-		},
-	}
-
-	gql := graphQLClient(client.http, repo.RepoHost())
-	err := gql.MutateNamed(context.Background(), "IssueClose", &mutation, variables)
-
-	if err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func IssueReopen(client *Client, repo ghrepo.Interface, issue Issue) error {
-	var mutation struct {
-		ReopenIssue struct {
-			Issue struct {
-				ID githubv4.ID
-			}
-		} `graphql:"reopenIssue(input: $input)"`
-	}
-
-	variables := map[string]interface{}{
-		"input": githubv4.ReopenIssueInput{
-			IssueID: issue.ID,
-		},
-	}
-
-	gql := graphQLClient(client.http, repo.RepoHost())
-	err := gql.MutateNamed(context.Background(), "IssueReopen", &mutation, variables)
-
-	return err
-}
-
-// milestoneNodeIdToDatabaseId extracts the REST Database ID from the GraphQL Node ID
-// This conversion is necessary since the GraphQL API requires the use of the milestone's database ID
-// for querying the related issues.
-func milestoneNodeIdToDatabaseId(nodeId string) (string, error) {
-	// The Node ID is Base64 obfuscated, with an underlying pattern:
-	// "09:Milestone12345", where "12345" is the database ID
-	decoded, err := base64.StdEncoding.DecodeString(nodeId)
-	if err != nil {
-		return "", err
-	}
-	splitted := strings.Split(string(decoded), "Milestone")
-	if len(splitted) != 2 {
-		return "", fmt.Errorf("couldn't get database id from node id")
-	}
-	return splitted[1], nil
+func (i Issue) CurrentUserComments() []Comment {
+	return i.Comments.CurrentUserComments()
 }

@@ -1,37 +1,65 @@
 # Releasing
 
-Our build system automatically compiles and attaches cross-platform binaries to any git tag named `vX.Y.Z`. The automated changelog is generated from commit messages starting with “Merge pull request …” that landed between this tag and the previous one (as determined topologically by git).
+To read about what happens during a production deployment, see the [release process deep dive doc](release-process-deep-dive.md).
 
-Users who run official builds of `gh` on their machines will get notified about the new version within a 24 hour period.
+To initiate a new production deployment:
 
-To test out the build system, publish a prerelease tag with a name such as `vX.Y.Z-pre.0` or `vX.Y.Z-rc.1`. Note that such a release will still be public, but it will be marked as a "prerelease", meaning that it will never show up as a "latest" release nor trigger upgrade notifications for users.
+```sh
+script/release vX.Y.Z
+```
+
+See `script/release --help` for more information.
+
+> [!NOTE]
+> Deployment workflow requires maintainer approval to run.
+
+What this does is:
+
+- Builds Linux binaries on Ubuntu;
+- Builds and signs Windows binaries on Windows;
+- Builds, signs, and notarizes macOS binaries on macOS;
+- Uploads all release artifacts to a new GitHub Release;
+- A new git tag `vX.Y.Z` is created in the remote repository;
+- The changelog is [generated from the list of merged pull requests](https://docs.github.com/en/repositories/releasing-projects-on-github/automatically-generated-release-notes);
+- Updates [GitHub CLI marketing site](https://cli.github.com) with the contents of the new release;
+- Updates the [`gh` Homebrew formula](https://github.com/williammartin/homebrew-core/blob/master/Formula/g/gh.rb) in the [`homebrew/homebrew-core` repo](https://github.com/search?q=repo%3AHomebrew%2Fhomebrew-core+%22gh%22+in%3Atitle&type=pullrequests).
+
+> [!NOTE]
+> `Homebrew/formulae.brew.sh` makes new formula versions available every 15 minutes through scheduled [CI workflow](https://github.com/Homebrew/formulae.brew.sh/actions/workflows/tests.yml).
+>
+> For more information, see https://docs.brew.sh/Formula-Cookbook#an-introduction
+
+To test out the build system while avoiding creating an actual release:
+
+```sh
+script/release --staging vX.Y.Z --branch patch-1 -p macos
+```
+
+The build artifacts will be available via `gh run download <RUN> -n macos`.
 
 ## General guidelines
 
-* Features to be released should be reviewed and approved at least one day prior to the release.
-* Feature releases should bump up the minor version number.
+- Features to be released should be reviewed and approved at least one day prior
+  to the release.
+- Feature releases should bump up the minor version number.
+- Breaking releases should bump up the major version number. These should
+  generally be rare.
 
-## Tagging a new release
+## Test the build system locally
 
-1. `git tag v1.2.3 && git push origin v1.2.3`
-2. Wait several minutes for builds to run: <https://github.com/cli/cli/actions>
-3. Check <https://github.com/cli/cli/releases>
-4. Scan generated release notes and optionally add a human touch by grouping items under topic sections
-5. Verify the marketing site was updated: <https://cli.github.com>
-6. (Optional) Delete any pre-releases related to this release.
+A local release can be created for testing without creating anything official on
+the release page.
 
-A successful build will result in changes across several repositories:
-* <https://github.com/github/cli.github.com>
-* <https://github.com/github/homebrew-gh>
-* <https://github.com/Homebrew/homebrew-core/pulls>
-* <https://github.com/cli/scoop-gh>
+1. Make sure GoReleaser is installed: `brew install goreleaser`
+2. `script/release --local`
+3. Find the built products under `dist/`.
 
-If the build fails, there is not a clean way to re-run it. The easiest way would be to start over by deleting the partial release on GitHub and re-publishing the tag. Note that this might be disruptive to users or tooling that were already notified about an upgrade. If a functional release and its binaries are already out there, it might be better to try to manually fix up only the specific workflow tasks that failed. Use your best judgement depending on the failure type.
+## Cleaning up a bad release
 
-## Release locally for debugging
+Occasionally, it might be necessary to clean up a bad release and re-release.
 
-A local release can be created for testing without creating anything official on the release page.
-
-0. Make sure GoReleaser is installed: `brew install goreleaser`
-1. `goreleaser --skip-validate --skip-publish --rm-dist`
-2. Find the built products under `dist/`.
+1. Delete the release and associated tag
+2. Re-release and monitor the workflow run logs
+3. Open pull request updating [`gh` Homebrew formula](https://github.com/williammartin/homebrew-core/blob/master/Formula/g/gh.rb)
+   with new SHA versions, linking the previous PR
+4. Verify resulting Debian and RPM packages, Homebrew formula

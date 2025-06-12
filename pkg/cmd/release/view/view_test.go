@@ -3,20 +3,44 @@ package view
 import (
 	"bytes"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"testing"
 	"time"
 
 	"github.com/MakeNowJust/heredoc"
-	"github.com/cli/cli/internal/ghrepo"
-	"github.com/cli/cli/pkg/cmdutil"
-	"github.com/cli/cli/pkg/httpmock"
-	"github.com/cli/cli/pkg/iostreams"
+	"github.com/cli/cli/v2/internal/ghrepo"
+	"github.com/cli/cli/v2/pkg/cmd/release/shared"
+	"github.com/cli/cli/v2/pkg/cmdutil"
+	"github.com/cli/cli/v2/pkg/httpmock"
+	"github.com/cli/cli/v2/pkg/iostreams"
+	"github.com/cli/cli/v2/pkg/jsonfieldstest"
 	"github.com/google/shlex"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestJSONFields(t *testing.T) {
+	jsonfieldstest.ExpectCommandToSupportJSONFields(t, NewCmdView, []string{
+		"apiUrl",
+		"author",
+		"assets",
+		"body",
+		"createdAt",
+		"databaseId",
+		"id",
+		"isDraft",
+		"isPrerelease",
+		"name",
+		"publishedAt",
+		"tagName",
+		"tarballUrl",
+		"targetCommitish",
+		"uploadUrl",
+		"url",
+		"zipballUrl",
+	})
+}
 
 func Test_NewCmdView(t *testing.T) {
 	tests := []struct {
@@ -56,13 +80,13 @@ func Test_NewCmdView(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			io, _, _, _ := iostreams.Test()
-			io.SetStdoutTTY(tt.isTTY)
-			io.SetStdinTTY(tt.isTTY)
-			io.SetStderrTTY(tt.isTTY)
+			ios, _, _, _ := iostreams.Test()
+			ios.SetStdoutTTY(tt.isTTY)
+			ios.SetStdinTTY(tt.isTTY)
+			ios.SetStderrTTY(tt.isTTY)
 
 			f := &cmdutil.Factory{
-				IOStreams: io,
+				IOStreams: ios,
 			}
 
 			var opts *ViewOptions
@@ -77,8 +101,8 @@ func Test_NewCmdView(t *testing.T) {
 			cmd.SetArgs(argv)
 
 			cmd.SetIn(&bytes.Buffer{})
-			cmd.SetOut(ioutil.Discard)
-			cmd.SetErr(ioutil.Discard)
+			cmd.SetOut(io.Discard)
+			cmd.SetErr(io.Discard)
 
 			_, err = cmd.ExecuteC()
 			if tt.wantErr != "" {
@@ -100,18 +124,20 @@ func Test_viewRun(t *testing.T) {
 	require.NoError(t, err)
 
 	tests := []struct {
-		name       string
-		isTTY      bool
-		releasedAt time.Time
-		opts       ViewOptions
-		wantErr    string
-		wantStdout string
-		wantStderr string
+		name        string
+		isTTY       bool
+		releaseBody string
+		releasedAt  time.Time
+		opts        ViewOptions
+		wantErr     string
+		wantStdout  string
+		wantStderr  string
 	}{
 		{
-			name:       "view specific release",
-			isTTY:      true,
-			releasedAt: oneHourAgo,
+			name:        "view specific release",
+			isTTY:       true,
+			releaseBody: `* Fixed bugs\n`,
+			releasedAt:  oneHourAgo,
 			opts: ViewOptions{
 				TagName: "v1.2.3",
 			},
@@ -124,40 +150,68 @@ func Test_viewRun(t *testing.T) {
 				
 				
 				Assets
-				windows.zip  12 B
-				linux.tgz    34 B
+				NAME         DIGEST           SIZE
+				windows.zip  sha256:deadc0de  12 B
+				linux.tgz                     34 B
 				
 				View on GitHub: https://github.com/OWNER/REPO/releases/tags/v1.2.3
 			`),
 			wantStderr: ``,
 		},
 		{
-			name:       "view latest release",
-			isTTY:      true,
-			releasedAt: oneHourAgo,
+			name:        "view latest release",
+			isTTY:       true,
+			releaseBody: `* Fixed bugs\n`,
+			releasedAt:  oneHourAgo,
 			opts: ViewOptions{
 				TagName: "",
 			},
 			wantStdout: heredoc.Doc(`
 				v1.2.3
 				MonaLisa released this about 1 day ago
-				
+
 				                                                                              
 				  • Fixed bugs                                                                
-				
-				
+
+
 				Assets
-				windows.zip  12 B
-				linux.tgz    34 B
-				
+				NAME         DIGEST           SIZE
+				windows.zip  sha256:deadc0de  12 B
+				linux.tgz                     34 B
+
 				View on GitHub: https://github.com/OWNER/REPO/releases/tags/v1.2.3
 			`),
 			wantStderr: ``,
 		},
 		{
-			name:       "view machine-readable",
-			isTTY:      false,
-			releasedAt: frozenTime,
+			name:        "view machine-readable",
+			isTTY:       false,
+			releaseBody: `* Fixed bugs\n`,
+			releasedAt:  frozenTime,
+			opts: ViewOptions{
+				TagName: "v1.2.3",
+			},
+			wantStdout: heredoc.Doc(`
+				title:	
+				tag:	v1.2.3
+				draft:	false
+				prerelease:	false
+				author:	MonaLisa
+				created:	2020-08-31T15:44:24+02:00
+				published:	2020-08-31T15:44:24+02:00
+				url:	https://github.com/OWNER/REPO/releases/tags/v1.2.3
+				asset:	windows.zip
+				asset:	linux.tgz
+				--
+				* Fixed bugs
+			`),
+			wantStderr: ``,
+		},
+		{
+			name:        "view machine-readable but body has no ending newline",
+			isTTY:       false,
+			releaseBody: `* Fixed bugs`,
+			releasedAt:  frozenTime,
 			opts: ViewOptions{
 				TagName: "v1.2.3",
 			},
@@ -180,32 +234,28 @@ func Test_viewRun(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			io, _, stdout, stderr := iostreams.Test()
-			io.SetStdoutTTY(tt.isTTY)
-			io.SetStdinTTY(tt.isTTY)
-			io.SetStderrTTY(tt.isTTY)
-
-			path := "repos/OWNER/REPO/releases/tags/v1.2.3"
-			if tt.opts.TagName == "" {
-				path = "repos/OWNER/REPO/releases/latest"
-			}
+			ios, _, stdout, stderr := iostreams.Test()
+			ios.SetStdoutTTY(tt.isTTY)
+			ios.SetStdinTTY(tt.isTTY)
+			ios.SetStderrTTY(tt.isTTY)
 
 			fakeHTTP := &httpmock.Registry{}
-			fakeHTTP.Register(httpmock.REST("GET", path), httpmock.StringResponse(fmt.Sprintf(`{
+			defer fakeHTTP.Verify(t)
+			shared.StubFetchRelease(t, fakeHTTP, "OWNER", "REPO", tt.opts.TagName, fmt.Sprintf(`{
 				"tag_name": "v1.2.3",
 				"draft": false,
 				"author": { "login": "MonaLisa" },
-				"body": "* Fixed bugs\n",
+				"body": "%[2]s",
 				"created_at": "%[1]s",
 				"published_at": "%[1]s",
 				"html_url": "https://github.com/OWNER/REPO/releases/tags/v1.2.3",
 				"assets": [
-					{ "name": "windows.zip", "size": 12 },
-					{ "name": "linux.tgz", "size": 34 }
+					{ "name": "windows.zip", "size": 12, "digest": "sha256:deadc0de" },
+					{ "name": "linux.tgz", "size": 34, "digest": null }
 				]
-			}`, tt.releasedAt.Format(time.RFC3339))))
+			}`, tt.releasedAt.Format(time.RFC3339), tt.releaseBody))
 
-			tt.opts.IO = io
+			tt.opts.IO = ios
 			tt.opts.HttpClient = func() (*http.Client, error) {
 				return &http.Client{Transport: fakeHTTP}, nil
 			}

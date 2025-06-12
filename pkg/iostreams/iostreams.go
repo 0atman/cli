@@ -2,34 +2,67 @@ package iostreams
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"os/exec"
-	"strconv"
+	"os/signal"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/briandowns/spinner"
+	ghTerm "github.com/cli/go-gh/v2/pkg/term"
+	"github.com/cli/safeexec"
 	"github.com/google/shlex"
 	"github.com/mattn/go-colorable"
 	"github.com/mattn/go-isatty"
-	"golang.org/x/crypto/ssh/terminal"
 )
 
-type IOStreams struct {
-	In     io.ReadCloser
-	Out    io.Writer
-	ErrOut io.Writer
+const DefaultWidth = 80
 
-	// the original (non-colorable) output stream
-	originalOut  io.Writer
-	colorEnabled bool
-	is256enabled bool
+// ErrClosedPagerPipe is the error returned when writing to a pager that has been closed.
+type ErrClosedPagerPipe struct {
+	error
+}
+
+type fileWriter interface {
+	io.Writer
+	Fd() uintptr
+}
+
+type fileReader interface {
+	io.ReadCloser
+	Fd() uintptr
+}
+
+type term interface {
+	IsTerminalOutput() bool
+	IsColorEnabled() bool
+	Is256ColorSupported() bool
+	IsTrueColorSupported() bool
+	Theme() string
+	Size() (int, int, error)
+}
+
+type IOStreams struct {
+	term term
+
+	In     fileReader
+	Out    fileWriter
+	ErrOut fileWriter
+
+	terminalTheme string
 
 	progressIndicatorEnabled bool
 	progressIndicator        *spinner.Spinner
+	progressIndicatorMu      sync.Mutex
+	spinnerDisabled          bool
+
+	alternateScreenBufferEnabled bool
+	alternateScreenBufferActive  bool
+	alternateScreenBufferMu      sync.Mutex
 
 	stdinTTYOverride  bool
 	stdinIsTTY        bool
@@ -38,18 +71,79 @@ type IOStreams struct {
 	stderrTTYOverride bool
 	stderrIsTTY       bool
 
+	colorOverride           bool
+	colorEnabled            bool
+	colorLabels             bool
+	accessibleColorsEnabled bool
+
 	pagerCommand string
 	pagerProcess *os.Process
 
-	neverPrompt bool
+	neverPrompt               bool
+	accessiblePrompterEnabled bool
+
+	TempFileOverride *os.File
 }
 
 func (s *IOStreams) ColorEnabled() bool {
-	return s.colorEnabled
+	if s.colorOverride {
+		return s.colorEnabled
+	}
+	return s.term.IsColorEnabled()
 }
 
 func (s *IOStreams) ColorSupport256() bool {
-	return s.is256enabled
+	if s.colorOverride {
+		return s.colorEnabled
+	}
+	return s.term.Is256ColorSupported()
+}
+
+func (s *IOStreams) HasTrueColor() bool {
+	if s.colorOverride {
+		return s.colorEnabled
+	}
+	return s.term.IsTrueColorSupported()
+}
+
+func (s *IOStreams) ColorLabels() bool {
+	return s.colorLabels
+}
+
+// DetectTerminalTheme is a utility to call before starting the output pager so that the terminal background
+// can be reliably detected.
+func (s *IOStreams) DetectTerminalTheme() {
+	if !s.ColorEnabled() || s.pagerProcess != nil {
+		s.terminalTheme = "none"
+		return
+	}
+
+	style := os.Getenv("GLAMOUR_STYLE")
+	if style != "" && style != "auto" {
+		// ensure GLAMOUR_STYLE takes precedence over "light" and "dark" themes
+		s.terminalTheme = "none"
+		return
+	}
+
+	s.terminalTheme = s.term.Theme()
+}
+
+// TerminalTheme returns "light", "dark", or "none" depending on the background color of the terminal.
+func (s *IOStreams) TerminalTheme() string {
+	if s.terminalTheme == "" {
+		s.DetectTerminalTheme()
+	}
+
+	return s.terminalTheme
+}
+
+func (s *IOStreams) SetColorEnabled(colorEnabled bool) {
+	s.colorOverride = true
+	s.colorEnabled = colorEnabled
+}
+
+func (s *IOStreams) SetColorLabels(colorLabels bool) {
+	s.colorLabels = colorLabels
 }
 
 func (s *IOStreams) SetStdinTTY(isTTY bool) {
@@ -76,10 +170,12 @@ func (s *IOStreams) IsStdoutTTY() bool {
 	if s.stdoutTTYOverride {
 		return s.stdoutIsTTY
 	}
-	if stdout, ok := s.Out.(*os.File); ok {
-		return isTerminal(stdout)
+	// support GH_FORCE_TTY
+	if s.term.IsTerminalOutput() {
+		return true
 	}
-	return false
+	stdout, ok := s.Out.(*os.File)
+	return ok && isCygwinTerminal(stdout.Fd())
 }
 
 func (s *IOStreams) SetStderrTTY(isTTY bool) {
@@ -101,8 +197,12 @@ func (s *IOStreams) SetPager(cmd string) {
 	s.pagerCommand = cmd
 }
 
+func (s *IOStreams) GetPager() string {
+	return s.pagerCommand
+}
+
 func (s *IOStreams) StartPager() error {
-	if s.pagerCommand == "" || !s.IsStdoutTTY() {
+	if s.pagerCommand == "" || s.pagerCommand == "cat" || !s.IsStdoutTTY() {
 		return nil
 	}
 
@@ -124,7 +224,11 @@ func (s *IOStreams) StartPager() error {
 		pagerEnv = append(pagerEnv, "LV=-c")
 	}
 
-	pagerCmd := exec.Command(pagerArgs[0], pagerArgs[1:]...)
+	pagerExe, err := safeexec.LookPath(pagerArgs[0])
+	if err != nil {
+		return err
+	}
+	pagerCmd := exec.Command(pagerExe, pagerArgs[1:]...)
 	pagerCmd.Env = pagerEnv
 	pagerCmd.Stdout = s.Out
 	pagerCmd.Stderr = s.ErrOut
@@ -132,7 +236,10 @@ func (s *IOStreams) StartPager() error {
 	if err != nil {
 		return err
 	}
-	s.Out = pagedOut
+	s.Out = &fdWriteCloser{
+		fd:          s.Out.Fd(),
+		WriteCloser: &pagerWriter{pagedOut},
+	}
 	err = pagerCmd.Start()
 	if err != nil {
 		return err
@@ -146,7 +253,8 @@ func (s *IOStreams) StopPager() {
 		return
 	}
 
-	s.Out.(io.ReadCloser).Close()
+	// if a pager was started, we're guaranteed to have a WriteCloser
+	_ = s.Out.(io.WriteCloser).Close()
 	_, _ = s.pagerProcess.Wait()
 	s.pagerProcess = nil
 }
@@ -159,20 +267,89 @@ func (s *IOStreams) CanPrompt() bool {
 	return s.IsStdinTTY() && s.IsStdoutTTY()
 }
 
+func (s *IOStreams) GetNeverPrompt() bool {
+	return s.neverPrompt
+}
+
 func (s *IOStreams) SetNeverPrompt(v bool) {
 	s.neverPrompt = v
 }
 
+func (s *IOStreams) GetSpinnerDisabled() bool {
+	return s.spinnerDisabled
+}
+
+func (s *IOStreams) SetSpinnerDisabled(v bool) {
+	s.spinnerDisabled = v
+}
+
 func (s *IOStreams) StartProgressIndicator() {
+	s.StartProgressIndicatorWithLabel("")
+}
+
+func (s *IOStreams) StartProgressIndicatorWithLabel(label string) {
 	if !s.progressIndicatorEnabled {
 		return
 	}
-	sp := spinner.New(spinner.CharSets[11], 400*time.Millisecond, spinner.WithWriter(s.ErrOut))
+
+	if s.spinnerDisabled {
+		// If the spinner is disabled, simply print a
+		// textual progress indicator and return.
+		// This means that s.ProgressIndicator will be nil.
+		// See also: the comment on StopProgressIndicator()
+		s.startTextualProgressIndicator(label)
+		return
+	}
+
+	s.progressIndicatorMu.Lock()
+	defer s.progressIndicatorMu.Unlock()
+
+	if s.progressIndicator != nil {
+		if label == "" {
+			s.progressIndicator.Prefix = ""
+		} else {
+			s.progressIndicator.Prefix = label + " "
+		}
+		return
+	}
+
+	// https://github.com/briandowns/spinner#available-character-sets
+	// ⣾ ⣷ ⣽ ⣻ ⡿
+	spinnerStyle := spinner.CharSets[11]
+
+	sp := spinner.New(spinnerStyle, 120*time.Millisecond, spinner.WithWriter(s.ErrOut), spinner.WithColor("fgCyan"))
+	if label != "" {
+		sp.Prefix = label + " "
+	}
+
 	sp.Start()
 	s.progressIndicator = sp
 }
 
+func (s *IOStreams) startTextualProgressIndicator(label string) {
+	s.progressIndicatorMu.Lock()
+	defer s.progressIndicatorMu.Unlock()
+
+	// Default label when spinner disabled is "Working..."
+	if label == "" {
+		label = "Working..."
+	}
+
+	// Add an ellipsis to the label if it doesn't already have one.
+	ellipsis := "..."
+	if !strings.HasSuffix(label, ellipsis) {
+		label = label + ellipsis
+	}
+
+	fmt.Fprintf(s.ErrOut, "%s%s", s.ColorScheme().Cyan(label), "\n")
+}
+
+// StopProgressIndicator stops the progress indicator if it is running.
+// Note that a textual progess indicator does not create a progress indicator,
+// so this method is a no-op in that case.
 func (s *IOStreams) StopProgressIndicator() {
+	s.progressIndicatorMu.Lock()
+	defer s.progressIndicatorMu.Unlock()
 	if s.progressIndicator == nil {
 		return
 	}
@@ -180,83 +357,254 @@ func (s *IOStreams) StopProgressIndicator() {
 	s.progressIndicator = nil
 }
 
-func (s *IOStreams) TerminalWidth() int {
-	defaultWidth := 80
-	out := s.Out
-	if s.originalOut != nil {
-		out = s.originalOut
-	}
+func (s *IOStreams) RunWithProgress(label string, run func() error) error {
+	s.StartProgressIndicatorWithLabel(label)
+	defer s.StopProgressIndicator()
 
-	if w, _, err := terminalSize(out); err == nil {
-		return w
-	}
+	return run()
+}
 
-	if isCygwinTerminal(out) {
-		tputCmd := exec.Command("tput", "cols")
-		tputCmd.Stdin = os.Stdin
-		if out, err := tputCmd.Output(); err == nil {
-			if w, err := strconv.Atoi(strings.TrimSpace(string(out))); err == nil {
-				return w
-			}
+func (s *IOStreams) StartAlternateScreenBuffer() {
+	if s.alternateScreenBufferEnabled {
+		s.alternateScreenBufferMu.Lock()
+		defer s.alternateScreenBufferMu.Unlock()
+
+		if _, err := fmt.Fprint(s.Out, "\x1b[?1049h"); err == nil {
+			s.alternateScreenBufferActive = true
+
+			ch := make(chan os.Signal, 1)
+			signal.Notify(ch, os.Interrupt)
+
+			go func() {
+				<-ch
+				s.StopAlternateScreenBuffer()
+
+				os.Exit(1)
+			}()
 		}
 	}
+}
 
-	return defaultWidth
+func (s *IOStreams) StopAlternateScreenBuffer() {
+	s.alternateScreenBufferMu.Lock()
+	defer s.alternateScreenBufferMu.Unlock()
+
+	if s.alternateScreenBufferActive {
+		fmt.Fprint(s.Out, "\x1b[?1049l")
+		s.alternateScreenBufferActive = false
+	}
+}
+
+func (s *IOStreams) SetAlternateScreenBufferEnabled(enabled bool) {
+	s.alternateScreenBufferEnabled = enabled
+}
+
+func (s *IOStreams) RefreshScreen() {
+	if s.IsStdoutTTY() {
+		// Move cursor to 0,0
+		fmt.Fprint(s.Out, "\x1b[0;0H")
+		// Clear from cursor to bottom of screen
+		fmt.Fprint(s.Out, "\x1b[J")
+	}
+}
+
+// TerminalWidth returns the width of the terminal that controls the process
+func (s *IOStreams) TerminalWidth() int {
+	w, _, err := s.term.Size()
+	if err == nil && w > 0 {
+		return w
+	}
+	return DefaultWidth
 }
 
 func (s *IOStreams) ColorScheme() *ColorScheme {
-	return NewColorScheme(s.ColorEnabled(), s.ColorSupport256())
+	return &ColorScheme{
+		Enabled:       s.ColorEnabled(),
+		EightBitColor: s.ColorSupport256(),
+		TrueColor:     s.HasTrueColor(),
+		Accessible:    s.AccessibleColorsEnabled(),
+		ColorLabels:   s.ColorLabels(),
+		Theme:         s.TerminalTheme(),
+	}
+}
+
+func (s *IOStreams) ReadUserFile(fn string) ([]byte, error) {
+	var r io.ReadCloser
+	if fn == "-" {
+		r = s.In
+	} else {
+		var err error
+		r, err = os.Open(fn)
+		if err != nil {
+			return nil, err
+		}
+	}
+	defer r.Close()
+	return io.ReadAll(r)
+}
+
+func (s *IOStreams) TempFile(dir, pattern string) (*os.File, error) {
+	if s.TempFileOverride != nil {
+		return s.TempFileOverride, nil
+	}
+	return os.CreateTemp(dir, pattern)
+}
+
+func (s *IOStreams) SetAccessibleColorsEnabled(enabled bool) {
+	s.accessibleColorsEnabled = enabled
+}
+
+func (s *IOStreams) AccessibleColorsEnabled() bool {
+	return s.accessibleColorsEnabled
+}
+
+func (s *IOStreams) SetAccessiblePrompterEnabled(enabled bool) {
+	s.accessiblePrompterEnabled = enabled
+}
+
+func (s *IOStreams) AccessiblePrompterEnabled() bool {
+	return s.accessiblePrompterEnabled
 }
 
 func System() *IOStreams {
-	stdoutIsTTY := isTerminal(os.Stdout)
-	stderrIsTTY := isTerminal(os.Stderr)
+	terminal := ghTerm.FromEnv()
+
+	var stdout fileWriter = os.Stdout
+	// On Windows with no virtual terminal processing support, translate ANSI escape
+	// sequences to console syscalls.
+	if colorableStdout := colorable.NewColorable(os.Stdout); colorableStdout != os.Stdout {
+		// Ensure that the file descriptor of the original stdout is preserved.
+		stdout = &fdWriter{
+			fd:     os.Stdout.Fd(),
+			Writer: colorableStdout,
+		}
+	}
+
+	var stderr fileWriter = os.Stderr
+	// On Windows with no virtual terminal processing support, translate ANSI escape
+	// sequences to console syscalls.
+	if colorableStderr := colorable.NewColorable(os.Stderr); colorableStderr != os.Stderr {
+		// Ensure that the file descriptor of the original stderr is preserved.
+		stderr = &fdWriter{
+			fd:     os.Stderr.Fd(),
+			Writer: colorableStderr,
+		}
+	}
 
 	io := &IOStreams{
 		In:           os.Stdin,
-		originalOut:  os.Stdout,
-		Out:          colorable.NewColorable(os.Stdout),
-		ErrOut:       colorable.NewColorable(os.Stderr),
-		colorEnabled: EnvColorForced() || (!EnvColorDisabled() && stdoutIsTTY),
-		is256enabled: Is256ColorSupported(),
+		Out:          stdout,
+		ErrOut:       stderr,
 		pagerCommand: os.Getenv("PAGER"),
+		term:         &terminal,
 	}
+
+	stdoutIsTTY := io.IsStdoutTTY()
+	stderrIsTTY := io.IsStderrTTY()
 
 	if stdoutIsTTY && stderrIsTTY {
 		io.progressIndicatorEnabled = true
 	}
 
-	// prevent duplicate isTerminal queries now that we know the answer
-	io.SetStdoutTTY(stdoutIsTTY)
-	io.SetStderrTTY(stderrIsTTY)
+	if stdoutIsTTY && hasAlternateScreenBuffer(terminal.IsTrueColorSupported()) {
+		io.alternateScreenBufferEnabled = true
+	}
+
 	return io
+}
+
+type fakeTerm struct{}
+
+func (t fakeTerm) IsTerminalOutput() bool {
+	return false
+}
+
+func (t fakeTerm) IsColorEnabled() bool {
+	return false
+}
+
+func (t fakeTerm) Is256ColorSupported() bool {
+	return false
+}
+
+func (t fakeTerm) IsTrueColorSupported() bool {
+	return false
+}
+
+func (t fakeTerm) Theme() string {
+	return ""
+}
+
+func (t fakeTerm) Size() (int, int, error) {
+	return 80, -1, nil
 }
 
 func Test() (*IOStreams, *bytes.Buffer, *bytes.Buffer, *bytes.Buffer) {
 	in := &bytes.Buffer{}
 	out := &bytes.Buffer{}
 	errOut := &bytes.Buffer{}
-	return &IOStreams{
-		In:     ioutil.NopCloser(in),
-		Out:    out,
-		ErrOut: errOut,
-	}, in, out, errOut
+	io := &IOStreams{
+		In: &fdReader{
+			fd:         0,
+			ReadCloser: io.NopCloser(in),
+		},
+		Out:    &fdWriter{fd: 1, Writer: out},
+		ErrOut: &fdWriter{fd: 2, Writer: errOut},
+		term:   &fakeTerm{},
+	}
+	io.SetStdinTTY(false)
+	io.SetStdoutTTY(false)
+	io.SetStderrTTY(false)
+	return io, in, out, errOut
 }
 
 func isTerminal(f *os.File) bool {
-	return isatty.IsTerminal(f.Fd()) || isatty.IsCygwinTerminal(f.Fd())
+	return ghTerm.IsTerminal(f) || isCygwinTerminal(f.Fd())
 }
 
-func isCygwinTerminal(w io.Writer) bool {
-	if f, isFile := w.(*os.File); isFile {
-		return isatty.IsCygwinTerminal(f.Fd())
-	}
-	return false
+func isCygwinTerminal(fd uintptr) bool {
+	return isatty.IsCygwinTerminal(fd)
 }
 
-func terminalSize(w io.Writer) (int, int, error) {
-	if f, isFile := w.(*os.File); isFile {
-		return terminal.GetSize(int(f.Fd()))
+// pagerWriter implements a WriteCloser that wraps all EPIPE errors in an ErrClosedPagerPipe type.
+type pagerWriter struct {
+	io.WriteCloser
+}
+
+func (w *pagerWriter) Write(d []byte) (int, error) {
+	n, err := w.WriteCloser.Write(d)
+	if err != nil && (errors.Is(err, io.ErrClosedPipe) || isEpipeError(err)) {
+		return n, &ErrClosedPagerPipe{err}
 	}
-	return 0, 0, fmt.Errorf("%v is not a file", w)
+	return n, err
+}
+
+// fdWriter represents a wrapped stdout Writer that preserves the original file descriptor
+type fdWriter struct {
+	io.Writer
+	fd uintptr
+}
+
+func (w *fdWriter) Fd() uintptr {
+	return w.fd
+}
+
+// fdWriteCloser represents a wrapped stdout Writer that preserves the original file descriptor
+type fdWriteCloser struct {
+	io.WriteCloser
+	fd uintptr
+}
+
+func (w *fdWriteCloser) Fd() uintptr {
+	return w.fd
+}
+
+// fdReader represents a wrapped stdin ReadCloser that preserves the original file descriptor
+type fdReader struct {
+	io.ReadCloser
+	fd uintptr
+}
+
+func (r *fdReader) Fd() uintptr {
+	return r.fd
 }

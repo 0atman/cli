@@ -1,19 +1,16 @@
 package list
 
 import (
-	"fmt"
-	"sort"
-
 	"github.com/MakeNowJust/heredoc"
-	"github.com/cli/cli/internal/config"
-	"github.com/cli/cli/pkg/cmdutil"
-	"github.com/cli/cli/pkg/iostreams"
-	"github.com/cli/cli/utils"
+	"github.com/cli/cli/v2/internal/gh"
+	"github.com/cli/cli/v2/pkg/cmdutil"
+	"github.com/cli/cli/v2/pkg/iostreams"
 	"github.com/spf13/cobra"
+	"gopkg.in/yaml.v3"
 )
 
 type ListOptions struct {
-	Config func() (config.Config, error)
+	Config func() (gh.Config, error)
 	IO     *iostreams.IOStreams
 }
 
@@ -24,8 +21,9 @@ func NewCmdList(f *cmdutil.Factory, runF func(*ListOptions) error) *cobra.Comman
 	}
 
 	cmd := &cobra.Command{
-		Use:   "list",
-		Short: "List your aliases",
+		Use:     "list",
+		Short:   "List your aliases",
+		Aliases: []string{"ls"},
 		Long: heredoc.Doc(`
 			This command prints out all of the aliases gh is configured to use.
 		`),
@@ -47,32 +45,14 @@ func listRun(opts *ListOptions) error {
 		return err
 	}
 
-	aliasCfg, err := cfg.Aliases()
-	if err != nil {
-		return fmt.Errorf("couldn't read aliases config: %w", err)
-	}
-
-	if aliasCfg.Empty() {
-		if opts.IO.IsStdoutTTY() {
-			fmt.Fprintf(opts.IO.ErrOut, "no aliases configured\n")
-		}
-		return nil
-	}
-
-	tp := utils.NewTablePrinter(opts.IO)
+	aliasCfg := cfg.Aliases()
 
 	aliasMap := aliasCfg.All()
-	keys := []string{}
-	for alias := range aliasMap {
-		keys = append(keys, alias)
-	}
-	sort.Strings(keys)
 
-	for _, alias := range keys {
-		tp.AddField(alias+":", nil, nil)
-		tp.AddField(aliasMap[alias], nil, nil)
-		tp.EndRow()
+	if len(aliasMap) == 0 {
+		return cmdutil.NewNoResultsError("no aliases configured")
 	}
 
-	return tp.Render()
+	enc := yaml.NewEncoder(opts.IO.Out)
+	return enc.Encode(aliasMap)
 }

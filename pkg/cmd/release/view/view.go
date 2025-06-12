@@ -1,6 +1,7 @@
 package view
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -8,18 +9,26 @@ import (
 	"time"
 
 	"github.com/MakeNowJust/heredoc"
-	"github.com/cli/cli/internal/ghrepo"
-	"github.com/cli/cli/pkg/cmd/release/shared"
-	"github.com/cli/cli/pkg/cmdutil"
-	"github.com/cli/cli/pkg/iostreams"
-	"github.com/cli/cli/utils"
+	"github.com/cli/cli/v2/internal/ghrepo"
+	"github.com/cli/cli/v2/internal/tableprinter"
+	"github.com/cli/cli/v2/internal/text"
+	"github.com/cli/cli/v2/pkg/cmd/release/shared"
+	"github.com/cli/cli/v2/pkg/cmdutil"
+	"github.com/cli/cli/v2/pkg/iostreams"
+	"github.com/cli/cli/v2/pkg/markdown"
 	"github.com/spf13/cobra"
 )
+
+type browser interface {
+	Browse(string) error
+}
 
 type ViewOptions struct {
 	HttpClient func() (*http.Client, error)
 	IO         *iostreams.IOStreams
 	BaseRepo   func() (ghrepo.Interface, error)
+	Browser    browser
+	Exporter   cmdutil.Exporter
 
 	TagName string
 	WebMode bool
@@ -29,6 +38,7 @@ func NewCmdView(f *cmdutil.Factory, runF func(*ViewOptions) error) *cobra.Comman
 	opts := &ViewOptions{
 		IO:         f.IOStreams,
 		HttpClient: f.HttpClient,
+		Browser:    f.Browser,
 	}
 
 	cmd := &cobra.Command{
@@ -57,6 +67,7 @@ func NewCmdView(f *cmdutil.Factory, runF func(*ViewOptions) error) *cobra.Comman
 	}
 
 	cmd.Flags().BoolVarP(&opts.WebMode, "web", "w", false, "Open the release in the browser")
+	cmdutil.AddJSONFlags(cmd, &opts.Exporter, shared.ReleaseFields)
 
 	return cmd
 }
@@ -72,15 +83,16 @@ func viewRun(opts *ViewOptions) error {
 		return err
 	}
 
+	ctx := context.Background()
 	var release *shared.Release
 
 	if opts.TagName == "" {
-		release, err = shared.FetchLatestRelease(httpClient, baseRepo)
+		release, err = shared.FetchLatestRelease(ctx, httpClient, baseRepo)
 		if err != nil {
 			return err
 		}
 	} else {
-		release, err = shared.FetchRelease(httpClient, baseRepo, opts.TagName)
+		release, err = shared.FetchRelease(ctx, httpClient, baseRepo, opts.TagName)
 		if err != nil {
 			return err
 		}
@@ -88,9 +100,19 @@ func viewRun(opts *ViewOptions) error {
 
 	if opts.WebMode {
 		if opts.IO.IsStdoutTTY() {
-			fmt.Fprintf(opts.IO.ErrOut, "Opening %s in your browser.\n", utils.DisplayURL(release.HTMLURL))
+			fmt.Fprintf(opts.IO.ErrOut, "Opening %s in your browser.\n", text.DisplayURL(release.URL))
 		}
-		return utils.OpenInBrowser(release.HTMLURL)
+		return opts.Browser.Browse(release.URL)
+	}
+
+	opts.IO.DetectTerminalTheme()
+	if err := opts.IO.StartPager(); err != nil {
+		fmt.Fprintf(opts.IO.ErrOut, "error starting pager: %v\n", err)
+	}
+	defer opts.IO.StopPager()
+
+	if opts.Exporter != nil {
+		return opts.Exporter.Write(opts.IO, release)
 	}
 
 	if opts.IO.IsStdoutTTY() {
@@ -107,33 +129,40 @@ func viewRun(opts *ViewOptions) error {
 }
 
 func renderReleaseTTY(io *iostreams.IOStreams, release *shared.Release) error {
-	iofmt := io.ColorScheme()
+	cs := io.ColorScheme()
 	w := io.Out
 
-	fmt.Fprintf(w, "%s\n", iofmt.Bold(release.TagName))
+	fmt.Fprintf(w, "%s\n", cs.Bold(release.TagName))
 	if release.IsDraft {
-		fmt.Fprintf(w, "%s • ", iofmt.Red("Draft"))
+		fmt.Fprintf(w, "%s • ", cs.Red("Draft"))
 	} else if release.IsPrerelease {
-		fmt.Fprintf(w, "%s • ", iofmt.Yellow("Pre-release"))
+		fmt.Fprintf(w, "%s • ", cs.Yellow("Pre-release"))
 	}
 	if release.IsDraft {
-		fmt.Fprintf(w, "%s\n", iofmt.Gray(fmt.Sprintf("%s created this %s", release.Author.Login, utils.FuzzyAgo(time.Since(release.CreatedAt)))))
+		fmt.Fprintln(w, cs.Mutedf("%s created this %s", release.Author.Login, text.FuzzyAgo(time.Now(), release.CreatedAt)))
 	} else {
-		fmt.Fprintf(w, "%s\n", iofmt.Gray(fmt.Sprintf("%s released this %s", release.Author.Login, utils.FuzzyAgo(time.Since(release.PublishedAt)))))
+		fmt.Fprintln(w, cs.Mutedf("%s released this %s", release.Author.Login, text.FuzzyAgo(time.Now(), *release.PublishedAt)))
 	}
 
-	renderedDescription, err := utils.RenderMarkdown(release.Body)
+	renderedDescription, err := markdown.Render(release.Body,
+		markdown.WithTheme(io.TerminalTheme()),
+		markdown.WithWrap(io.TerminalWidth()))
 	if err != nil {
 		return err
 	}
 	fmt.Fprintln(w, renderedDescription)
 
 	if len(release.Assets) > 0 {
-		fmt.Fprintf(w, "%s\n", iofmt.Bold("Assets"))
-		table := utils.NewTablePrinter(io)
+		fmt.Fprintln(w, cs.Bold("Assets"))
+		table := tableprinter.New(io, tableprinter.WithHeader("Name", "Digest", "Size"))
 		for _, a := range release.Assets {
-			table.AddField(a.Name, nil, nil)
-			table.AddField(humanFileSize(a.Size), nil, nil)
+			table.AddField(a.Name)
+			if a.Digest == nil {
+				table.AddField("")
+			} else {
+				table.AddField(*a.Digest)
+			}
+			table.AddField(humanFileSize(a.Size))
 			table.EndRow()
 		}
 		err := table.Render()
@@ -143,7 +172,7 @@ func renderReleaseTTY(io *iostreams.IOStreams, release *shared.Release) error {
 		fmt.Fprint(w, "\n")
 	}
 
-	fmt.Fprintf(w, "%s\n", iofmt.Gray(fmt.Sprintf("View on GitHub: %s", release.HTMLURL)))
+	fmt.Fprintln(w, cs.Mutedf("View on GitHub: %s", release.URL))
 	return nil
 }
 
@@ -157,12 +186,15 @@ func renderReleasePlain(w io.Writer, release *shared.Release) error {
 	if !release.IsDraft {
 		fmt.Fprintf(w, "published:\t%s\n", release.PublishedAt.Format(time.RFC3339))
 	}
-	fmt.Fprintf(w, "url:\t%s\n", release.HTMLURL)
+	fmt.Fprintf(w, "url:\t%s\n", release.URL)
 	for _, a := range release.Assets {
 		fmt.Fprintf(w, "asset:\t%s\n", a.Name)
 	}
 	fmt.Fprint(w, "--\n")
 	fmt.Fprint(w, release.Body)
+	if !strings.HasSuffix(release.Body, "\n") {
+		fmt.Fprintf(w, "\n")
+	}
 	return nil
 }
 

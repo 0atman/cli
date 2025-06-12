@@ -1,7 +1,6 @@
 package githubtemplate
 
 import (
-	"io/ioutil"
 	"os"
 	"path"
 	"reflect"
@@ -9,7 +8,7 @@ import (
 )
 
 func TestFindNonLegacy(t *testing.T) {
-	tmpdir, err := ioutil.TempDir("", "gh-cli")
+	tmpdir, err := os.MkdirTemp("", "gh-cli")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -141,7 +140,7 @@ func TestFindNonLegacy(t *testing.T) {
 }
 
 func TestFindLegacy(t *testing.T) {
-	tmpdir, err := ioutil.TempDir("", "gh-cli")
+	tmpdir, err := os.MkdirTemp("", "gh-cli")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -250,10 +249,10 @@ func TestFindLegacy(t *testing.T) {
 			}
 
 			got := FindLegacy(tt.args.rootDir, tt.args.name)
-			if got == nil {
+			if got == "" {
 				t.Errorf("FindLegacy() = nil, want %v", tt.want)
-			} else if *got != tt.want {
-				t.Errorf("FindLegacy() = %v, want %v", *got, tt.want)
+			} else if got != tt.want {
+				t.Errorf("FindLegacy() = %v, want %v", got, tt.want)
 			}
 		})
 		os.RemoveAll(tmpdir)
@@ -261,12 +260,11 @@ func TestFindLegacy(t *testing.T) {
 }
 
 func TestExtractName(t *testing.T) {
-	tmpfile, err := ioutil.TempFile("", "gh-cli")
+	tmpfile, err := os.CreateTemp(t.TempDir(), "gh-cli")
 	if err != nil {
 		t.Fatal(err)
 	}
-	tmpfile.Close()
-	defer os.Remove(tmpfile.Name())
+	defer tmpfile.Close()
 
 	type args struct {
 		filePath string
@@ -313,7 +311,7 @@ about: This is how you report bugs
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_ = ioutil.WriteFile(tmpfile.Name(), []byte(tt.prepare), 0600)
+			_ = os.WriteFile(tmpfile.Name(), []byte(tt.prepare), 0600)
 			if got := ExtractName(tt.args.filePath); got != tt.want {
 				t.Errorf("ExtractName() = %v, want %v", got, tt.want)
 			}
@@ -321,13 +319,73 @@ about: This is how you report bugs
 	}
 }
 
-func TestExtractContents(t *testing.T) {
-	tmpfile, err := ioutil.TempFile("", "gh-cli")
+func TestExtractTitle(t *testing.T) {
+	tmpfile, err := os.CreateTemp(t.TempDir(), "gh-cli")
 	if err != nil {
 		t.Fatal(err)
 	}
-	tmpfile.Close()
-	defer os.Remove(tmpfile.Name())
+	defer tmpfile.Close()
+
+	type args struct {
+		filePath string
+	}
+	tests := []struct {
+		name    string
+		prepare string
+		args    args
+		want    string
+	}{
+		{
+			name: "Complete front-matter",
+			prepare: `---
+name: Bug Report
+title: 'bug: '
+about: This is how you report bugs
+---
+
+**Template contents**
+`,
+			args: args{
+				filePath: tmpfile.Name(),
+			},
+			want: "bug: ",
+		},
+		{
+			name: "Incomplete front-matter",
+			prepare: `---
+about: This is how you report bugs
+---
+`,
+			args: args{
+				filePath: tmpfile.Name(),
+			},
+			want: "",
+		},
+		{
+			name:    "No front-matter",
+			prepare: `name: This is not yaml!`,
+			args: args{
+				filePath: tmpfile.Name(),
+			},
+			want: "",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_ = os.WriteFile(tmpfile.Name(), []byte(tt.prepare), 0600)
+			if got := ExtractTitle(tt.args.filePath); got != tt.want {
+				t.Errorf("ExtractTitle() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestExtractContents(t *testing.T) {
+	tmpfile, err := os.CreateTemp(t.TempDir(), "gh-cli")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tmpfile.Close()
 
 	type args struct {
 		filePath string
@@ -378,7 +436,7 @@ Even more
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_ = ioutil.WriteFile(tmpfile.Name(), []byte(tt.prepare), 0600)
+			_ = os.WriteFile(tmpfile.Name(), []byte(tt.prepare), 0600)
 			if got := ExtractContents(tt.args.filePath); string(got) != tt.want {
 				t.Errorf("ExtractContents() = %v, want %v", string(got), tt.want)
 			}

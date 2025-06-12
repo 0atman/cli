@@ -5,11 +5,11 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/cli/cli/internal/ghrepo"
-	"github.com/cli/cli/pkg/cmdutil"
-	"github.com/cli/cli/pkg/iostreams"
-	"github.com/cli/cli/pkg/text"
-	"github.com/cli/cli/utils"
+	"github.com/cli/cli/v2/internal/ghrepo"
+	"github.com/cli/cli/v2/internal/tableprinter"
+	"github.com/cli/cli/v2/internal/text"
+	"github.com/cli/cli/v2/pkg/cmdutil"
+	"github.com/cli/cli/v2/pkg/iostreams"
 	"github.com/spf13/cobra"
 )
 
@@ -18,7 +18,12 @@ type ListOptions struct {
 	IO         *iostreams.IOStreams
 	BaseRepo   func() (ghrepo.Interface, error)
 
-	LimitResults int
+	Exporter cmdutil.Exporter
+
+	LimitResults       int
+	ExcludeDrafts      bool
+	ExcludePreReleases bool
+	Order              string
 }
 
 func NewCmdList(f *cmdutil.Factory, runF func(*ListOptions) error) *cobra.Command {
@@ -28,9 +33,10 @@ func NewCmdList(f *cmdutil.Factory, runF func(*ListOptions) error) *cobra.Comman
 	}
 
 	cmd := &cobra.Command{
-		Use:   "list",
-		Short: "List releases in a repository",
-		Args:  cobra.NoArgs,
+		Use:     "list",
+		Short:   "List releases in a repository",
+		Aliases: []string{"ls"},
+		Args:    cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			// support `-R, --repo` override
 			opts.BaseRepo = f.BaseRepo
@@ -43,6 +49,10 @@ func NewCmdList(f *cmdutil.Factory, runF func(*ListOptions) error) *cobra.Comman
 	}
 
 	cmd.Flags().IntVarP(&opts.LimitResults, "limit", "L", 30, "Maximum number of items to fetch")
+	cmd.Flags().BoolVar(&opts.ExcludeDrafts, "exclude-drafts", false, "Exclude draft releases")
+	cmd.Flags().BoolVar(&opts.ExcludePreReleases, "exclude-pre-releases", false, "Exclude pre-releases")
+	cmdutil.StringEnumFlag(cmd, &opts.Order, "order", "O", "desc", []string{"asc", "desc"}, "Order of releases returned")
+	cmdutil.AddJSONFlags(cmd, &opts.Exporter, releaseFields)
 
 	return cmd
 }
@@ -58,52 +68,55 @@ func listRun(opts *ListOptions) error {
 		return err
 	}
 
-	releases, err := fetchReleases(httpClient, baseRepo, opts.LimitResults)
+	releases, err := fetchReleases(httpClient, baseRepo, opts.LimitResults, opts.ExcludeDrafts, opts.ExcludePreReleases, opts.Order)
 	if err != nil {
 		return err
 	}
 
-	now := time.Now()
-	table := utils.NewTablePrinter(opts.IO)
-	iofmt := opts.IO.ColorScheme()
-	seenLatest := false
+	if len(releases) == 0 && opts.Exporter == nil {
+		return cmdutil.NewNoResultsError("no releases found")
+	}
+
+	if err := opts.IO.StartPager(); err == nil {
+		defer opts.IO.StopPager()
+	} else {
+		fmt.Fprintf(opts.IO.ErrOut, "failed to start pager: %v\n", err)
+	}
+
+	if opts.Exporter != nil {
+		return opts.Exporter.Write(opts.IO, releases)
+	}
+
+	table := tableprinter.New(opts.IO, tableprinter.WithHeader("Title", "Type", "Tag name", "Published"))
+	cs := opts.IO.ColorScheme()
 	for _, rel := range releases {
-		title := text.ReplaceExcessiveWhitespace(rel.Name)
+		title := text.RemoveExcessiveWhitespace(rel.Name)
 		if title == "" {
 			title = rel.TagName
 		}
-		table.AddField(title, nil, nil)
+		table.AddField(title)
 
 		badge := ""
 		var badgeColor func(string) string
-		if !rel.IsDraft && !rel.IsPrerelease && !seenLatest {
+		if rel.IsLatest {
 			badge = "Latest"
-			badgeColor = iofmt.Green
-			seenLatest = true
+			badgeColor = cs.Green
 		} else if rel.IsDraft {
 			badge = "Draft"
-			badgeColor = iofmt.Red
+			badgeColor = cs.Red
 		} else if rel.IsPrerelease {
 			badge = "Pre-release"
-			badgeColor = iofmt.Yellow
+			badgeColor = cs.Yellow
 		}
-		table.AddField(badge, nil, badgeColor)
+		table.AddField(badge, tableprinter.WithColor(badgeColor))
 
-		tagName := rel.TagName
-		if table.IsTTY() {
-			tagName = fmt.Sprintf("(%s)", tagName)
-		}
-		table.AddField(tagName, nil, nil)
+		table.AddField(rel.TagName, tableprinter.WithTruncate(nil))
 
 		pubDate := rel.PublishedAt
 		if rel.PublishedAt.IsZero() {
 			pubDate = rel.CreatedAt
 		}
-		publishedAt := pubDate.Format(time.RFC3339)
-		if table.IsTTY() {
-			publishedAt = utils.FuzzyAgo(now.Sub(pubDate))
-		}
-		table.AddField(publishedAt, nil, iofmt.Gray)
+		table.AddTimeField(time.Now(), pubDate, cs.Muted)
 		table.EndRow()
 	}
 	err = table.Render()

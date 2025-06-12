@@ -1,13 +1,17 @@
 package view
 
 import (
+	"bytes"
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 
-	"github.com/cli/cli/api"
-	"github.com/cli/cli/internal/ghrepo"
+	"github.com/cli/cli/v2/api"
+	"github.com/cli/cli/v2/internal/ghrepo"
+	"github.com/cli/go-gh/v2/pkg/asciisanitizer"
+	"golang.org/x/text/transform"
 )
 
 var NotFoundError = errors.New("not found")
@@ -15,6 +19,7 @@ var NotFoundError = errors.New("not found")
 type RepoReadme struct {
 	Filename string
 	Content  string
+	BaseURL  string
 }
 
 func RepositoryReadme(client *http.Client, repo ghrepo.Interface, branch string) (*RepoReadme, error) {
@@ -22,6 +27,7 @@ func RepositoryReadme(client *http.Client, repo ghrepo.Interface, branch string)
 	var response struct {
 		Name    string
 		Content string
+		HTMLURL string `json:"html_url"`
 	}
 
 	err := apiClient.REST(repo.RepoHost(), "GET", getReadmePath(repo, branch), nil, &response)
@@ -38,9 +44,15 @@ func RepositoryReadme(client *http.Client, repo ghrepo.Interface, branch string)
 		return nil, fmt.Errorf("failed to decode readme: %w", err)
 	}
 
+	sanitized, err := io.ReadAll(transform.NewReader(bytes.NewReader(decoded), &asciisanitizer.Sanitizer{}))
+	if err != nil {
+		return nil, err
+	}
+
 	return &RepoReadme{
 		Filename: response.Name,
-		Content:  string(decoded),
+		Content:  string(sanitized),
+		BaseURL:  response.HTMLURL,
 	}, nil
 }
 
